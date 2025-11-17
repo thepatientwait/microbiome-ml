@@ -4,10 +4,9 @@ A Python module for standardizing machine learning applications within our resea
 
 ## Features
 
-- **Feature Engineering**: Tools for manipulating and transforming ML features
-- **Data Annotation**: Integration with third-party services for sample annotation
-- **Label Management**: Parsing, cleaning, and standardizing label data
-- **Research Workflows**: Standardized pipelines for common ML research tasks
+- Opinionated dataset structure for consistent and robust microbiome machine learning tasks
+- Easy to use user interface for building datasets from various data sources
+- Integration with popular machine learning libraries
 
 ## Installation
 
@@ -29,25 +28,52 @@ pixi shell
 ## Quick Start
 
 ```python
-from microbiome_ml import FeatureProcessor, DataAnnotator, LabelCleaner
+from microbiome_ml import Dataset
+from microbiome_ml import CrossValidator, Visualiser
 
-# Feature manipulation
-processor = FeatureProcessor()
-features = processor.transform(raw_data)
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 
-# Sample annotation
-annotator = DataAnnotator(provider="external_api")
-annotated_samples = annotator.annotate(samples)
+# input
+dataset = (
+    Dataset()
+    .add_metadata(
+        metadata="path/to/metadata.csv",
+        attributes="path/to/attributes.csv",
+        study_titles="path/to/study_titles.csv"
+        )
+    .add_profiles("path/to/profiles.csv")
+    .add_feature_set({
+        "kmer_features": "path/to/kmer_features.csv",
+        "protein_features": "path/to/protein_features.csv",
+        ...
+        })
+    .add_labels({
+        "temperature": "path/to/temperature_labels.csv",
+        "ph": "path/to/ph_labels.csv",
+        "oxygen": "path/to/oxygen_labels.csv",
+        ...
+        })
+    .apply_preprocessing()
+    .add_taxonomic_features()
+    )
 
-# Label cleaning
-cleaner = LabelCleaner()
-clean_labels = cleaner.parse_and_clean(raw_labels)
+# save and load
+# saves to a human readable directory structure with .csv files
+dataset.save("path/to/save/dataset")
+dataset = Dataset.load("path/to/save/dataset", compression=False)
+
+# machine learning
+# by default they always iterate over all feature sets, models and labels
+cv = CrossValidator(
+    dataset, 
+    model=[RandomForestRegressor(), GradientBoostingRegressor()]
+    )
+
+results = cv.run()
+
+# visualisation
+visualiser = Visualiser(results)
+visualiser.plot_performance_metrics()
+visualiser.plot_feature_importances()
 ```
 
-## Development
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
-
-## License
-
-[Add your license here]
