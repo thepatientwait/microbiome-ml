@@ -32,7 +32,7 @@ class TestLazyWorkflow:
         assert loaded.profiles._is_lazy is True
         
     def test_lazy_to_eager_workflow(self, metadata_csv, attributes_csv, profiles_csv, tmp_path):
-        """Test lazy → process → materialize → save workflow."""
+        """Test lazy → process → collect → save workflow."""
         # Build and save dataset
         dataset = (Dataset()
                   .add_metadata(metadata=metadata_csv, attributes=attributes_csv)
@@ -44,9 +44,9 @@ class TestLazyWorkflow:
         # Reload lazily
         lazy_dataset = Dataset.scan(save_dir)
         
-        # Materialize
-        lazy_dataset.metadata.materialize()
-        lazy_dataset.profiles.materialize()
+        # collect
+        lazy_dataset.metadata.collect()
+        lazy_dataset.profiles.collect()
         
         assert lazy_dataset.metadata._is_lazy is False
         assert lazy_dataset.profiles._is_lazy is False
@@ -158,7 +158,7 @@ class TestMultiComponentSync:
         assert set(dataset._sample_ids) == {"S1", "S2"}
         
         # Verify all components filtered
-        dataset.metadata.materialize()
+        dataset.metadata.collect()
         assert set(dataset.metadata.metadata["sample"].to_list()) == {"S1", "S2"}
 
 

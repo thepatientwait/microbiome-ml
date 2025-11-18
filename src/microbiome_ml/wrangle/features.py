@@ -199,7 +199,7 @@ class FeatureSet:
         
         return feature_set
 
-    def materialize(self) -> "FeatureSet":
+    def collect(self) -> "FeatureSet":
         """
         Convert lazy FeatureSet to eager (numpy) mode.
         
@@ -240,7 +240,7 @@ class FeatureSet:
         """
         Convert FeatureSet back to wide-form DataFrame.
         
-        For lazy FeatureSets, this will materialize the LazyFrame first.
+        For lazy FeatureSets, this will collect the LazyFrame first.
             
         Returns:
             Wide-form DataFrame with accessions and features
@@ -367,7 +367,7 @@ class FeatureSet:
         """
         Save FeatureSet to disk as a .csv file.
         
-        For lazy FeatureSets, this will materialize the data first.
+        For lazy FeatureSets, this will collect the data first.
         
         Args:
             path: Path to save the .csv file
@@ -375,7 +375,7 @@ class FeatureSet:
         path = Path(path)
         
         if self._is_lazy:
-            # Materialize lazy data before saving
+            # collect lazy data before saving
             self._lf.collect().write_csv(path)
         else:
             # Eager mode: use to_df()

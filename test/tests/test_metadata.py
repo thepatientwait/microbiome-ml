@@ -46,25 +46,25 @@ class TestSampleMetadataInitialization:
         assert meta.study_titles is None
 
 
-class TestSampleMetadataMaterialize:
+class TestSampleMetadatacollect:
     """Test lazy-to-eager conversion."""
     
-    def test_materialize_lazy(self, sample_metadata_lazy):
+    def test_collect_lazy(self, sample_metadata_lazy):
         """Test materializing a lazy instance."""
         assert sample_metadata_lazy._is_lazy is True
         
-        sample_metadata_lazy.materialize()
+        sample_metadata_lazy.collect()
         
         assert sample_metadata_lazy._is_lazy is False
         assert sample_metadata_lazy.metadata is not None
         assert isinstance(sample_metadata_lazy.metadata, pl.DataFrame)
         assert sample_metadata_lazy._lf_metadata is None
         
-    def test_materialize_eager_noop(self, sample_metadata_eager):
+    def test_collect_eager_noop(self, sample_metadata_eager):
         """Test materializing an already-eager instance (no-op)."""
         assert sample_metadata_eager._is_lazy is False
         
-        sample_metadata_eager.materialize()
+        sample_metadata_eager.collect()
         
         assert sample_metadata_eager._is_lazy is False
         assert sample_metadata_eager.metadata is not None
@@ -83,7 +83,7 @@ class TestSampleMetadataSaveLoad:
         assert (save_dir / "study_titles.csv").exists()
         
     def test_save_lazy(self, sample_metadata_lazy, tmp_path):
-        """Test saving lazy instance (should materialize)."""
+        """Test saving lazy instance (should collect)."""
         save_dir = tmp_path / "metadata_save_lazy"
         sample_metadata_lazy.save(save_dir)
         
@@ -143,8 +143,8 @@ class TestSampleMetadataFiltering:
         assert filtered._is_lazy is True
         assert filtered._lf_metadata is not None
         
-        # Materialize to check results
-        filtered.materialize()
+        # collect to check results
+        filtered.collect()
         assert filtered.metadata.height == 2
         assert set(filtered.metadata["sample"].to_list()) == {"S2", "S4"}
 

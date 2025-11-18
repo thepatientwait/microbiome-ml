@@ -253,7 +253,7 @@ class TaxonomicProfiles:
             _is_lazy=True
         )
     
-    def materialize(self) -> None:
+    def collect(self) -> None:
         """
         Convert lazy TaxonomicProfiles to eager (DataFrame) mode in-place.
         
@@ -275,7 +275,7 @@ class TaxonomicProfiles:
         """
         Save TaxonomicProfiles to CSV files in a directory.
         
-        For lazy instances, this will materialize the data first.
+        For lazy instances, this will collect the data first.
         
         Args:
             path: Directory path to save files (will be created if doesn't exist)

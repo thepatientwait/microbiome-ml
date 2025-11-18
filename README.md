@@ -41,7 +41,9 @@ dataset = (
         attributes="path/to/attributes.csv",
         study_titles="path/to/study_titles.csv"
         )
-    .add_profiles("path/to/profiles.csv")
+    .add_profiles(
+        profiles="path/to/profiles.csv",
+        root="path/to/root.csv",)
     .add_feature_set({
         "kmer_features": "path/to/kmer_features.csv",
         "protein_features": "path/to/protein_features.csv",

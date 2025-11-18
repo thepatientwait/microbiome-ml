@@ -45,25 +45,25 @@ class TestTaxonomicProfilesInitialization:
         assert profiles.root is not None
 
 
-class TestTaxonomicProfilesMaterialize:
+class TestTaxonomicProfilescollect:
     """Test lazy-to-eager conversion."""
     
-    def test_materialize_lazy(self, sample_profiles_lazy):
+    def test_collect_lazy(self, sample_profiles_lazy):
         """Test materializing a lazy instance."""
         assert sample_profiles_lazy._is_lazy is True
         
-        sample_profiles_lazy.materialize()
+        sample_profiles_lazy.collect()
         
         assert sample_profiles_lazy._is_lazy is False
         assert sample_profiles_lazy.profiles is not None
         assert isinstance(sample_profiles_lazy.profiles, pl.DataFrame)
         assert sample_profiles_lazy._lf_profiles is None
         
-    def test_materialize_eager_noop(self, sample_profiles_eager):
+    def test_collect_eager_noop(self, sample_profiles_eager):
         """Test materializing an already-eager instance (no-op)."""
         assert sample_profiles_eager._is_lazy is False
         
-        sample_profiles_eager.materialize()
+        sample_profiles_eager.collect()
         
         assert sample_profiles_eager._is_lazy is False
         assert sample_profiles_eager.profiles is not None
@@ -81,7 +81,7 @@ class TestTaxonomicProfilesSaveLoad:
         assert (save_dir / "root.csv").exists()
         
     def test_save_lazy(self, sample_profiles_lazy, tmp_path):
-        """Test saving lazy instance (should materialize)."""
+        """Test saving lazy instance (should collect)."""
         save_dir = tmp_path / "profiles_save_lazy"
         sample_profiles_lazy.save(save_dir)
         
@@ -140,8 +140,8 @@ class TestTaxonomicProfilesFiltering:
         assert filtered._is_lazy is True
         assert filtered._lf_profiles is not None
         
-        # Materialize to check results
-        filtered.materialize()
+        # collect to check results
+        filtered.collect()
         assert filtered._is_lazy is False
         assert filtered.profiles is not None
         unique_samples = set(filtered.profiles["sample"].unique().to_list())

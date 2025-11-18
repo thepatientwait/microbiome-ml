@@ -67,25 +67,25 @@ class TestFeatureSetLoadScan:
         assert fs.name == "lazy_test"
 
 
-class TestFeatureSetMaterialize:
+class TestFeatureSetcollect:
     """Test lazy-to-eager conversion."""
     
-    def test_materialize_lazy(self, sample_features_lazy):
+    def test_collect_lazy(self, sample_features_lazy):
         """Test materializing a lazy instance."""
         assert sample_features_lazy._is_lazy is True
         
-        materialized = sample_features_lazy.materialize()
+        collected = sample_features_lazy.collect()
         
-        assert materialized._is_lazy is False
-        assert materialized.features is not None
-        assert isinstance(materialized.features, np.ndarray)
-        assert materialized._lf is None
+        assert collected._is_lazy is False
+        assert collected.features is not None
+        assert isinstance(collected.features, np.ndarray)
+        assert collected._lf is None
         
-    def test_materialize_eager_noop(self, sample_features_eager):
+    def test_collect_eager_noop(self, sample_features_eager):
         """Test materializing an already-eager instance (no-op)."""
         assert sample_features_eager._is_lazy is False
         
-        sample_features_eager.materialize()
+        sample_features_eager.collect()
         
         assert sample_features_eager._is_lazy is False
 
@@ -101,7 +101,7 @@ class TestFeatureSetSave:
         assert save_path.exists()
         
     def test_save_lazy(self, sample_features_lazy, tmp_path):
-        """Test saving lazy instance (should materialize)."""
+        """Test saving lazy instance (should collect)."""
         save_path = tmp_path / "features_save_lazy.csv"
         sample_features_lazy.save(save_path)
         
@@ -164,8 +164,8 @@ class TestFeatureSetFiltering:
         
         assert filtered._is_lazy is True
         
-        # Materialize to check results
-        filtered.materialize()
+        # collect to check results
+        filtered.collect()
         assert filtered.accessions == samples_to_keep
 
 

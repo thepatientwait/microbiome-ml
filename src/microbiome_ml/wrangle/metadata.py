@@ -224,7 +224,7 @@ class SampleMetadata:
             _is_lazy=True
         )
     
-    def materialize(self) -> "SampleMetadata":
+    def collect(self) -> "SampleMetadata":
         """
         Convert lazy SampleMetadata to eager (DataFrame) mode in-place.
         
@@ -452,7 +452,7 @@ class SampleMetadata:
         """
         Save SampleMetadata to CSV files in a directory.
         
-        For lazy instances, this will materialize the data first.
+        For lazy instances, this will collect the data first.
         
         Args:
             path: Directory path to save files (will be created if doesn't exist)
