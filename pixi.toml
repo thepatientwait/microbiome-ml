@@ -25,6 +25,8 @@ flake8 = ">=6.0.0"
 mypy = ">=1.0.0"
 pre-commit = ">=3.0.0"
 hypothesis = ">=6.0.0"
+docformatter = ">=1.7.0"
+autoflake = ">=2.0.0"
 
 [feature.docs.dependencies]
 mkdocs = ">=1.5.0"
@@ -48,9 +50,16 @@ mkdocstrings = { version = ">=0.22.0" }
 # # Currently unused - placeholder for future bio dependencies
 # # biopython = ">=1.80"
 
+[tool.black]
+line-length = 79
+
+[tool.isort]
+profile = "black"
+line_length = 79
+
 [tasks]
-lint = "flake8 src/ test/tests/"
-format = "black src/ test/tests/ && isort src/ test/tests/"
+lint = "flake8 --extend-ignore=E203,W503,D,E501 --per-file-ignores='**/conftest.py:E501' src/ test/tests/"
+format = "autoflake --remove-all-unused-imports --remove-unused-variables --in-place --recursive src/ test/tests/ && docformatter --in-place --wrap-summaries 79 --wrap-descriptions 79 --recursive src/ test/tests/ && black --line-length 79 src/ test/tests/ && isort src/ test/tests/"
 type-check = "mypy src/"
 docs-serve = "mkdocs serve"
 docs-build = "mkdocs build"

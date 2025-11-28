@@ -1,7 +1,8 @@
 """Generic utilities for microbiome ML workflows."""
 
+from .logging import get_logger, setup_logging
 from .taxonomy import TaxonomicRanks
-from .logging import setup_logging, get_logger
+
 # Labeling utilities (if available)
 # from .labeling import GenericLabeler, join_dataframes
 

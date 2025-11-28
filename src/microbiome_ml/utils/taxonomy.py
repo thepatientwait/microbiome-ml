@@ -1,8 +1,10 @@
 from enum import IntEnum
 from typing import Optional
 
+
 class TaxonomicRanks(IntEnum):
     """Enumeration of supported taxonomic levels."""
+
     DOMAIN = 0
     PHYLUM = 1
     CLASS = 2
@@ -14,11 +16,11 @@ class TaxonomicRanks(IntEnum):
     @property
     def name(self) -> str:
         return super().name.lower()
-    
+
     @property
     def prefix(self) -> str:
         return f"{self.name[0]}__"
-    
+
     @property
     def child(self) -> Optional["TaxonomicRanks"]:
         """Get the child (more specific) taxonomic rank."""
@@ -26,7 +28,7 @@ class TaxonomicRanks(IntEnum):
             return TaxonomicRanks(self.value + 1)
         except ValueError:
             return None  # Already at lowest rank
-    
+
     @property
     def parent(self) -> Optional["TaxonomicRanks"]:
         """Get the parent (broader) taxonomic rank."""
@@ -47,12 +49,12 @@ class TaxonomicRanks(IntEnum):
     @classmethod
     def from_prefix(cls, prefix: str) -> "TaxonomicRanks":
         """Get enum member from taxonomic prefix."""
-        if not hasattr(cls, '_prefix_to_rank'):
+        if not hasattr(cls, "_prefix_to_rank"):
             cls._prefix_to_rank = {rank.prefix: rank for rank in cls}
-        
+
         if prefix not in cls._prefix_to_rank:
             raise ValueError(f"Invalid taxonomic prefix: {prefix}")
-        
+
         return cls._prefix_to_rank[prefix]
 
     @classmethod
@@ -84,4 +86,3 @@ class TaxonomicRanks(IntEnum):
         while rank is not None:
             yield rank
             rank = rank.child
-

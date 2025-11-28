@@ -15,18 +15,20 @@ jobs:
         python-version: ["3.9", "3.10", "3.11"]
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4  # Updated to v4
     
     - name: Setup pixi
-      uses: prefix-dev/setup-pixi@v0.4.1
+      uses: prefix-dev/setup-pixi@v0.8.1 # Updated to match your other file
       with:
-        pixi-version: latest
+        pixi-version: v0.40.0
+        cache: true
     
     - name: Install dependencies
       run: pixi install
     
-    - name: Run tests
-      run: pixi run test
+    - name: Run tests with coverage
+      # Explicitly running pytest with coverage flags to ensure xml is generated for codecov
+      run: pixi run pytest test/tests/ --cov=src/microbiome_ml --cov-report=xml --cov-report=term
     
     - name: Run linting
       run: pixi run lint
@@ -35,5 +37,9 @@ jobs:
       run: pixi run type-check
     
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.9'
+      uses: codecov/codecov-action@v4 # Updated to v4
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10' # Only upload once
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }} # Good practice to add token for v4
