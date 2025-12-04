@@ -1,7 +1,7 @@
 """Split management for train/test and cross-validation."""
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 import numpy as np
 import polars as pl
@@ -293,7 +293,7 @@ class SplitManager:
             }
 
             # Helper to compute best single-group move
-            def best_move(candidates, direction):
+            def best_move(candidates: List[str], direction: int) -> Tuple[Optional[str], int]:
                 # direction = +1 means move group from train->test (increase achieved)
                 # direction = -1 means move group from test->train (decrease achieved)
                 best_g = None
