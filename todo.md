@@ -4,7 +4,17 @@
 - [x] `Dataset` class with builder pattern
 - [x] `SampleMetadata` class
 - [x] `TaxonomicProfiles` class
-- [x] `FeatureSet` class
+- [x] `FeatureSet` class hierarchy
+  - **Abstract base class**: `FeatureSet` with scan/load/from_df methods
+  - **Species-level features**: `SpeciesFeatureSet` for taxonomy-based features
+  - **Sample-level features**: `SampleFeatureSet` for aggregated sample data
+  - **Type-safe polymorphism**: Proper method signatures across inheritance hierarchy
+- [x] `FeatureAggregator` class for species-to-sample conversion
+  - **8 aggregation methods**: arithmetic/geometric/harmonic mean, median, presence/absence, top-k abundant, min/max abundance
+  - **3 weighting strategies**: none, abundance-weighted, sqrt abundance-weighted
+  - **Configurable parameters**: k for top-k, pseudocount for geometric/harmonic, min_abundance threshold
+  - **Memory optimization**: Polars LazyFrame processing for large datasets
+  - **Feature quality control**: Remove features present in <10 samples (configurable)
 - [x] Add/load labels from multiple sources
 - [x] Add/load groupings from multiple sources
 - [x] Synchronization across all components
@@ -29,8 +39,15 @@
   - `iter_cv_folds()` to yield (label, scheme, cv_df) tuples
 - [x] Compression support for `save()` method
   - tar.gz compression with compress=True parameter
+- [x] Species-to-sample feature aggregation system
+  - **Multiple aggregation methods**: arithmetic/geometric/harmonic mean, median, presence/absence, top-k abundant, min/max abundance
+  - **Weighting strategies**: none, abundance-weighted, sqrt abundance-weighted
+  - **Memory-efficient processing**: Uses Polars LazyFrame for large datasets
+  - **Automatic relative abundance conversion**: TaxonomicProfiles converts coverage to relabund
+  - **Feature filtering**: Remove uncommon features with configurable cutoff
+  - **Unified API**: `add_taxonomic_features()` method with single or batch aggregation
 - [ ] Helper methods for accessing split data
-  - `get_train_samples(label, fold=None)` 
+  - `get_train_samples(label, fold=None)`
   - `get_test_samples(label, fold=None)`
 
 ## Machine Learning (train/)
@@ -57,11 +74,24 @@
 ## Testing
 - [x] Unit tests for `Dataset` splitting logic
 - [x] Tests for eager/lazy modes
+- [x] Test file organization and cleanup
+- [x] Type-safe testing configuration (tests excluded from mypy)
 - [ ] Integration tests for full workflows
 - [ ] Tests for `CrossValidator`
 - [ ] Tests for `Visualiser`
 
+## Code Quality & Type Safety
+- [x] Full mypy type checking with strict configuration
+- [x] Method signature compatibility across base/subclasses
+- [x] Abstract base class design (FeatureSet hierarchy)
+- [x] Polars DataFrame/LazyFrame type annotations
+- [x] Pre-commit hooks configuration aligned with type checking
+- [x] Mypy configuration optimized for src/ only
+- [x] Development workflow optimization
+
 ## Documentation
+- [x] Updated README.md with current features and development workflow
+- [x] Updated TODO list to reflect completed work
 - [ ] API reference documentation
 - [ ] Tutorial notebooks
   - Basic dataset construction
