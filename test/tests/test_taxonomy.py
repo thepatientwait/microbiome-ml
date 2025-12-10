@@ -89,7 +89,7 @@ class TestTaxonomicProfilesFeatureCreation:
     def real_profiles(self):
         """Load real test data."""
         return TaxonomicProfiles(
-            profiles="test/data/subset_real_filled_coverage.csv"
+            profiles="test/data/subset_real_filled_coverage.csv.gz"
         )
 
     def test_create_features_all_ranks(self, real_profiles):
