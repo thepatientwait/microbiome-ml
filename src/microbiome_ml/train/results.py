@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import polars as pl
 
 
 class CV_Result:
@@ -120,10 +119,6 @@ class CV_Result:
             ),
         }
 
-    def to_dataframe(self) -> pl.DataFrame:
-        """Return a single-row Polars DataFrame representing this object."""
-        return pl.DataFrame([self._to_dict()])
-
     def to_json(
         self, path: Optional[Union[str, Path]] = None, indent: int = 2
     ) -> str:
@@ -149,11 +144,8 @@ class CV_Result:
             Path(save_json).write_text(json.dumps(out, indent=2))
         return out
 
-    @staticmethod
-    def results_to_dataframe(results_list: List["CV_Result"]) -> pl.DataFrame:
-        """Convert a list of `CV_Result` objects into a Polars DataFrame."""
-        rows = [r._to_dict() for r in results_list]
-        return pl.DataFrame(rows)
+    # `results_to_dataframe` removed — use `export_result` / `results_dict_to_streaming_files`
+    # or construct a DataFrame from a list of `_to_dict()` results when needed.
 
     @staticmethod
     def export_result(
@@ -165,15 +157,26 @@ class CV_Result:
 
         Mapping -> streaming exporter; list -> JSON array.
         """
+        outp = Path(path)
         if isinstance(results_list, dict):
-            outp = Path(path)
             if outp.exists() and outp.is_file():
                 outp = outp.parent
             CV_Result.results_dict_to_streaming_files(results_list, outp)
             return
 
+        # For lists, always write NDJSON (one JSON object per line).
         rows = [r._to_dict() for r in results_list]
-        Path(path).write_text(json.dumps(rows, indent=indent))
+        # If `path` is a directory, create results.ndjson inside it.
+        if outp.exists() and outp.is_dir():
+            ndjson_path = outp / "results.ndjson"
+        else:
+            # Treat the provided path as the target file (create parent dirs)
+            ndjson_path = outp
+            ndjson_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with ndjson_path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, default=str) + "\n")
 
     @staticmethod
     def results_dict_to_streaming_files(

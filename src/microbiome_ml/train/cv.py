@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import PyYAML as yaml
+import yaml  # type: ignore[import]
 from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import make_scorer, mean_squared_error
@@ -23,21 +23,77 @@ from microbiome_ml.wrangle.dataset import Dataset
 logger = logging.getLogger(__name__)
 
 # Mapping of model short names to their constructors
-MODEL_MAP = {
-    "rf" or "random forest": lambda: RandomForestRegressor(),
-    "gb" or "gradient boosting": lambda: GradientBoostingRegressor(),
-    # "en": lambda: ElasticNet(),
-    # "mlp": lambda: MLPRegressor(),
-    # Add mapping for xgboost
-    "xgb" or "xgboost": lambda: XGBRegressor(),
+# Canonical constructors keyed by short names (keeps compatibility with hyperparameters.yaml)
+_MODEL_CONSTRUCTORS = {
+    "rf": lambda: RandomForestRegressor(),
+    "gb": lambda: GradientBoostingRegressor(),
+    "xgb": lambda: XGBRegressor(),
 }
+
+# Alias lists map many human-friendly synonyms to the canonical short keys above
+_MODEL_ALIASES = {
+    "rf": [
+        "rf",
+        "r f",
+        "rforest",
+        "r forest",
+        "randomforest",
+        "random forest",
+        "random forest regressor",
+        "random-forest",
+        "random_forest",
+    ],
+    "gb": [
+        "gb",
+        "gradient boosting",
+        "gradient_boosting",
+        "gradient-boosting",
+        "gradientboosting",
+    ],
+    "xgb": [
+        "xgb",
+        "xgboost",
+        "x gboost",
+        "x g b",
+    ],
+}
+
+
+def _normalize_alias(name: str) -> str:
+    s = (name or "").lower()
+    # keep only alnum and spaces, collapse spaces
+    s = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in s)
+    s = " ".join(s.split())
+    return s
+
+
+def _resolve_model_alias(name: str) -> str:
+    """Return canonical short key for a model alias (e.g. 'random forest' ->
+    'rf').
+
+    Raises ValueError if no match.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"Model alias must be a string, got: {type(name)}")
+    norm = _normalize_alias(name)
+    # first try exact match against alias lists
+    for canon, aliases in _MODEL_ALIASES.items():
+        for a in aliases:
+            if _normalize_alias(a) == norm:
+                return canon
+    # fallback: allow direct canonical key (already normalized)
+    if norm in _MODEL_CONSTRUCTORS:
+        return norm
+    raise ValueError(f"Unknown model alias: {name}")
 
 
 # Define a CrossValidator class to handle cross-validation process
 class CrossValidator:
-    """
-    Base class to perform cross-validation on microbiome datasets using specified models and CV schemes.
-    It supports multiple feature sets, labels, and CV schemes, and can handle hyperparameter tuning
+    """Base class to perform cross-validation on microbiome datasets using
+    specified models and CV schemes.
+
+    It supports multiple feature sets, labels, and CV schemes, and can handle
+    hyperparameter tuning
     """
 
     def __init__(
@@ -67,6 +123,10 @@ class CrossValidator:
         self.cv_folds = cv_folds
         self.label: Optional[Union[str, List[str]]] = label
         self.scheme: Optional[Union[str, List[str]]] = scheme
+        self._best_validation_r2: float = float("-inf")
+        self.best_result_key: Optional[str] = None
+        self.best_result: Optional[CV_Result] = None
+        self.best_model_estimator: Optional[Any] = None
 
     @staticmethod
     def load_param_grids(path: str) -> dict:
@@ -74,11 +134,24 @@ class CrossValidator:
             cfg = yaml.safe_load(f) or {}
         return cfg
 
-    def run_all(
+    def _update_best_model(
         self,
-        label: Optional[Union[str, List[str]]] = None,
+        key: str,
+        cv_result: CV_Result,
+        estimator: Optional[Any] = None,
+    ) -> None:
+        avg_r2 = cv_result.avg_validation_r2
+        if avg_r2 is None:
+            return
+        if avg_r2 > self._best_validation_r2:
+            self._best_validation_r2 = avg_r2
+            self.best_result_key = key
+            self.best_result = cv_result
+            self.best_model_estimator = estimator
+
+    def run(
+        self,
         param_path: str = "hyperparameters.yaml",
-        scheme: Optional[Union[str, List[str]]] = None,
     ) -> dict:
         """Manages the cross-validation process across different feature sets,
         labels, schemes, models, and hyperparameter combinations.
@@ -98,17 +171,15 @@ class CrossValidator:
 
         # Determine label and scheme to use
         labels_attr = getattr(self.dataset, "labels", None)
-        if label is not None:
-            label_to_use = label
-        elif self.label is not None:
+        if self.label is not None:
             label_to_use = self.label
         elif labels_attr is None:
             label_to_use = []
         else:
             cols = list(labels_attr.columns)
             label_to_use = [c for c in cols if c != "sample"]
-        if scheme is not None:
-            scheme_to_use = scheme
+        if self.scheme is not None:
+            scheme_to_use = self.scheme
         else:
             schemes = [s for _, s, _ in self.dataset.iter_cv_folds()]
             unique_schemes = list(dict.fromkeys(schemes))
@@ -132,23 +203,37 @@ class CrossValidator:
                 try:
                     fold_arr = np.array([r["fold"] for r in joined.to_dicts()])
                 except Exception:
-                    logging.getLogger(__name__).warning(
+                    logging.warning(
                         "Could not extract fold assignments for %s; skipping",
                         key,
                     )
                     continue
 
-            unique_folds = np.unique(fold_arr)
+            # ensure integer fold array and check per-fold sample counts
+            try:
+                fold_arr = np.asarray(fold_arr).ravel().astype(int)
+            except Exception:
+                logging.warning(
+                    "Fold assignments for %s could not be cast to integers; skipping",
+                    key,
+                )
+                continue
+
+            unique_folds, counts = np.unique(fold_arr, return_counts=True)
             if len(unique_folds) < 2:
-                logging.getLogger(__name__).warning(
+                logging.warning(
                     "Not enough folds for %s (found %d); skipping",
                     key,
                     len(unique_folds),
                 )
                 continue
-            fold_arr = (
-                np.array(joined.select("fold").to_numpy()).ravel().astype(int)
-            )
+            if np.min(counts) < 2:
+                logging.getLogger(__name__).warning(
+                    "One or more folds for %s contain fewer than 2 samples; skipping",
+                    key,
+                )
+                continue
+
             ps = PredefinedSplit(test_fold=fold_arr)  # uses your exact folds
 
             # scorers: r2 (higher better) and mse (we use neg mse and will negate back)
@@ -164,12 +249,10 @@ class CrossValidator:
 
             for model in self.models:
                 if isinstance(model, str):
-                    model_name = model.lower()
-                    if model_name not in MODEL_MAP:
-                        raise ValueError(f"Unknown model alias: {model_name}")
-                    grid = params_grid.get(model_name, [{}])
+                    model_key = _resolve_model_alias(model)
+                    grid = params_grid.get(model_key, [{}])
                     for params in ParameterGrid(grid):
-                        base_model = MODEL_MAP[model_name]()
+                        base_model = _MODEL_CONSTRUCTORS[model_key]()
                         base_model.set_params(**params)
                         cvres = cross_validate(
                             base_model,
@@ -184,9 +267,10 @@ class CrossValidator:
                         per_mse = [
                             -m for m in cvres["test_mse"]
                         ]  # negate because scorer is neg MSE
-                        results[
+                        result_key = (
                             f"{key}::{base_model.__class__.__name__}::{params}"
-                        ] = CV_Result(
+                        )
+                        cv_result = CV_Result(
                             feature_set=feature_name,
                             label=label_name,
                             scheme=scheme_name,
@@ -194,6 +278,8 @@ class CrossValidator:
                             validation_r2_per_fold=per_r2,
                             validation_mse_per_fold=per_mse,
                         )
+                        results[result_key] = cv_result
+                        self._update_best_model(result_key, cv_result)
                     continue  # skip to next model after processing all param combos
                 else:
                     # estimator instance provided by user
@@ -213,9 +299,10 @@ class CrossValidator:
                         )
                         per_r2 = list(cvres["test_r2"])
                         per_mse = [-v for v in cvres["test_mse"]]
-                        results[
+                        result_key = (
                             f"{key}::{est.__class__.__name__}::{params}"
-                        ] = CV_Result(
+                        )
+                        cv_result = CV_Result(
                             feature_set=feature_name,
                             label=label_name,
                             scheme=scheme_name,
@@ -223,16 +310,17 @@ class CrossValidator:
                             validation_r2_per_fold=per_r2,
                             validation_mse_per_fold=per_mse,
                         )
+                        results[result_key] = cv_result
+                        self._update_best_model(result_key, cv_result)
 
         return results
 
     def run_grid(
         self,
-        label: Optional[Union[str, List[str]]] = None,
         param_path: str = "hyperparameters.yaml",
-        scheme: Optional[Union[str, List[str]]] = None,
     ) -> dict:
         """Performs grid search cross-validation using predefined splits.
+
         Inputs:
             label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
             scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
@@ -240,10 +328,25 @@ class CrossValidator:
         Outputs:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
+        # Determine label and scheme to use
+        labels_attr = getattr(self.dataset, "labels", None)
+        if self.label is not None:
+            label_to_use = self.label
+        elif labels_attr is None:
+            label_to_use = []
+        else:
+            cols = list(labels_attr.columns)
+            label_to_use = [c for c in cols if c != "sample"]
+        if self.scheme is not None:
+            scheme_to_use = self.scheme
+        else:
+            schemes = [s for _, s, _ in self.dataset.iter_cv_folds()]
+            unique_schemes = list(dict.fromkeys(schemes))
+            scheme_to_use = unique_schemes
 
         results: Dict[str, CV_Result] = {}
         mapping = self._prepare_inputs(
-            self.dataset, fillna=0.0, label=label or self.label, scheme=scheme
+            self.dataset, fillna=0.0, label=label_to_use, scheme=scheme_to_use
         )
         param_grids = self.load_param_grids(param_path)
         scorers = {
@@ -263,11 +366,36 @@ class CrossValidator:
                 try:
                     fold_arr = np.array([r["fold"] for r in joined.to_dicts()])
                 except Exception:
-                    logging.getLogger(__name__).warning(
+                    logging.warning(
                         "Could not extract fold assignments for %s; skipping",
                         key,
                     )
                     continue
+
+            # ensure integer fold array and check per-fold sample counts
+            try:
+                fold_arr = np.asarray(fold_arr).ravel().astype(int)
+            except Exception:
+                logging.warning(
+                    "Fold assignments for %s could not be cast to integers; skipping",
+                    key,
+                )
+                continue
+
+            unique_folds, counts = np.unique(fold_arr, return_counts=True)
+            if len(unique_folds) < 2:
+                logging.warning(
+                    "Not enough folds for %s (found %d); skipping",
+                    key,
+                    len(unique_folds),
+                )
+                continue
+            if np.min(counts) < 2:
+                logging.warning(
+                    "One or more folds for %s contain fewer than 2 samples; skipping",
+                    key,
+                )
+                continue
 
             ps = PredefinedSplit(test_fold=fold_arr)
             X_arr = np.asarray(X_np)
@@ -275,11 +403,9 @@ class CrossValidator:
 
             for model in self.models:
                 if isinstance(model, str):
-                    mkey = model.lower()
-                    if mkey not in MODEL_MAP:
-                        raise ValueError(f"Unknown model alias: {model}")
-                    grid = param_grids.get(mkey, [{}])
-                    estimator = MODEL_MAP[mkey]()
+                    model_key = _resolve_model_alias(model)
+                    grid = param_grids.get(model_key, [{}])
+                    estimator = _MODEL_CONSTRUCTORS[model_key]()
                 else:
                     grid = [{}]
                     estimator = model
@@ -305,9 +431,8 @@ class CrossValidator:
                     for i in range(n_splits)
                 ]  # negate because scorer is neg MSE
 
-                results[
-                    f"{key}::{gs.best_estimator_.__class__.__name__}"
-                ] = CV_Result(
+                result_key = f"{key}::{gs.best_estimator_.__class__.__name__}"
+                cv_result = CV_Result(
                     feature_set=feature_name,
                     label=label_name,
                     scheme=scheme_name,
@@ -315,50 +440,11 @@ class CrossValidator:
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
                 )
+                results[result_key] = cv_result
+                self._update_best_model(
+                    result_key, cv_result, estimator=gs.best_estimator_
+                )
         return results
-
-    # def compile_results(
-    #     self,
-    #     r2_scores: Optional[List[float]] = None,
-    #     mse_scores: Optional[List[float]] = None,
-    # ) -> CV_Result:
-    #     r2_list = list(r2_scores) if r2_scores is not None else []
-    #     mse_list = list(mse_scores) if mse_scores is not None else []
-    #     if not scores_list and r2_list:
-    #         scores_list = r2_list
-    #     results = CV_Result(
-    #         validation_r2_per_fold=r2_list if r2_list else None,
-    #         validation_mse_per_fold=mse_list if mse_list else None,
-    #     )
-    #     results._compute_averages()
-    #     return results
-
-    # def _get_cv_strategy(self, groups: Optional[Any]) -> object: -> commented as we have fold assignment in the dataset already
-    #     if groups is None:
-    #         return KFold(n_splits=self.cv_folds, shuffle=True, random_state=42)
-    #     try:
-    #         import numpy as np
-    #         cleaned = []
-    #         for g in groups:
-    #             if g is None:
-    #                 continue
-    #             try:
-    #                 if isinstance(g, float) and np.isnan(g):
-    #                     continue
-    #             except Exception:
-    #                 pass
-    #             cleaned.append(g)
-    #         n_unique = len(set(map(str, cleaned)))
-    #     except Exception:
-    #         n_unique = 0
-    #     if n_unique >= max(2, self.cv_folds):
-    #         return GroupKFold(n_splits=self.cv_folds)
-    #     import logging
-    #     logging.getLogger(__name__).warning(
-    #         "Insufficient distinct groups for GroupKFold (found %d); falling back to KFold.",
-    #         n_unique,
-    #     )
-    #     return KFold(n_splits=self.cv_folds, shuffle=True, random_state=42)
 
     def _prepare_inputs(
         self,
@@ -475,9 +561,15 @@ class CrossValidator:
                     continue
 
                 # Determine CV schemes to use. Accept a single scheme name or a list/tuple/set of names.
-                available_cv_schemes = getattr(
-                    split_manager, "cv_schemes", None
-                )
+                # If `split_manager` is a plain dict mapping scheme->table, use it directly.
+                # Declare with an explicit Optional type to satisfy static type checkers.
+                available_cv_schemes: Optional[Dict[str, Any]] = None
+                if isinstance(split_manager, dict):
+                    available_cv_schemes = split_manager
+                else:
+                    available_cv_schemes = getattr(
+                        split_manager, "cv_schemes", None
+                    )
                 if scheme is not None:
                     if isinstance(scheme, (list, tuple, set)):
                         requested_schemes = list(scheme)
@@ -531,7 +623,7 @@ class CrossValidator:
                             if v is not None
                         ]
                         if not items:
-                            logging.getLogger(__name__).warning(
+                            logging.warning(
                                 "CV scheme '%s' for label '%s' contains no assigned folds; skipping",
                                 scheme_name,
                                 label_name,
@@ -541,7 +633,7 @@ class CrossValidator:
                         try:
                             folds = [int(v) for _, v in items]
                         except Exception:
-                            logging.getLogger(__name__).warning(
+                            logging.warning(
                                 "CV scheme '%s' for label '%s' has non-integer fold values; skipping",
                                 scheme_name,
                                 label_name,
@@ -556,7 +648,7 @@ class CrossValidator:
                         try:
                             cv_df = pl.DataFrame(scheme_table)
                         except Exception:
-                            logging.getLogger(__name__).warning(
+                            logging.warning(
                                 "Unsupported cv scheme format for '%s' in label '%s'",
                                 scheme_name,
                                 label_name,
@@ -584,7 +676,7 @@ class CrossValidator:
                         )
 
                     if n_folds < 2:
-                        logging.getLogger(__name__).warning(
+                        logging.warning(
                             "CV scheme '%s' for label '%s' has %d populated fold(s); skipping (need >=2)",
                             scheme_name,
                             label_name,
@@ -624,7 +716,7 @@ class CrossValidator:
                         .height
                     )
                     if n_folds_after < 2:
-                        logging.getLogger(__name__).warning(
+                        logging.warning(
                             "After dropping null labels CV scheme '%s' for label '%s' has %d fold(s); skipping",
                             scheme_name,
                             label_name,
@@ -658,6 +750,14 @@ class CrossValidator:
                         X_np,
                         y_np,
                         joined,
+                    )
+                    logger.info(
+                        "Prepared data for feature set '%s', label '%s', scheme '%s' with %d samples and %d features.",
+                        feat_name,
+                        label_name,
+                        scheme_name,
+                        X_np.shape[0],
+                        X_np.shape[1],
                     )
 
         return results

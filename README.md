@@ -98,6 +98,7 @@ dataset.create_all_cv_schemes(
 # Iterate over all CV folds
 for label, scheme, cv_df in dataset.iter_cv_folds():
     print(f"Label: {label}, Scheme: {scheme}, Samples: {cv_df.height}")
+```
 
 ## Feature Engineering Examples
 
@@ -130,7 +131,8 @@ for name, feature_set in dataset.feature_sets.items():
     # e.g., "tax_genus", "sample_genes", "pathway_features_arithmetic_mean_none"
 ```
 
-# Save and load (human-readable directory structure) and Result visualization
+## Save and load (human-readable directory structure) and Result visualization
+
 ```python
 dataset.save("path/to/save/dataset", compress=True)  # .tar.gz
 dataset.save("path/to/save/dataset") # saved in directory
@@ -143,7 +145,28 @@ cv = CrossValidator(
     models=[RandomForestRegressor(), GradientBoostingRegressor()]
     )
 
-results = cv.run()
+# Specify the label or scheme(s)
+cv = CrossValidator(
+    dataset,
+    models=[RandomForestRegressor(), GradientBoostingRegressor()],
+    label="ph",
+    scheme=["bioproject","ecoregion"]
+    )
+
+# Cross validation run
+results = cv.run(param_path="parameters.yaml")
+
+# Grid Cross validation run
+results_grid = cv.run_grid(param_path="hyperparameters.yaml")
+000
+# Save model and result
+from microbiome_ml.train.results import CV_Result
+if cv.best_model_estimator is not None and cv.best_result is not None:
+# Save the best estimator (gzip recommended, .pkl.gz)
+cv.best_result.save_model(cv.best_model_estimator, "out/best_model.pkl.gz", compress=True)
+
+# Persist results mapping or a single CV_Result
+CV_Result.save_mapping(results, "out/results", compress=True)
 
 # Visualization
 visualiser = Visualiser(results)
