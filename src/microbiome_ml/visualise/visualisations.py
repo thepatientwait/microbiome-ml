@@ -80,14 +80,18 @@ class Visualiser:
         else:
             self.output_dir = self.out
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.formats: List[str] = list(formats) if formats is not None else ["png"]
+        self.formats: List[str] = (
+            list(formats) if formats is not None else ["png"]
+        )
         invalid = set(self.formats) - _VALID_FORMATS
         if invalid:
             raise ValueError(
                 f"Unsupported format(s): {invalid}. Valid: {_VALID_FORMATS}"
             )
 
-    def _save_fig(self, fig: plt.Figure, path_stem: Path, dpi: int = 150) -> None:
+    def _save_fig(
+        self, fig: plt.Figure, path_stem: Path, dpi: int = 150
+    ) -> None:
         """Save *fig* in every format listed in ``self.formats``.
 
         *path_stem* must be a path **without** an extension; the appropriate
@@ -840,7 +844,7 @@ class Visualiser:
                     [title_parts[0]] + title_parts[1:]
                 )
 
-        plt.figure(figsize=(10, max(6, len(sorted_features) * 0.4)))
+        fig = plt.figure(figsize=(10, max(6, len(sorted_features) * 0.4)))
         plt.barh(sorted_features, sorted_importances, color="skyblue")
         plt.xlabel("Feature Importance")
         plt.title(title)
@@ -853,8 +857,9 @@ class Visualiser:
                 file_path.parent in (Path(""), Path("."))
                 and not file_path.is_absolute()
             ):
-                file_path = self.output_dir / file_path.name
+                file_path = self.output_dir / file_path.stem
             else:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-            plt.savefig(file_path, dpi=300)
+                file_path = file_path.with_suffix("")
+            self._save_fig(fig, file_path, dpi=300)
         plt.show()

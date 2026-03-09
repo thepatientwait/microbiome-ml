@@ -39,6 +39,21 @@ pixi shell
 pixi run pre-commit install
 ```
 
+## Terms
+
+| Term | Description |
+|------|-------------|
+| **feature** | A single input variable (column) used for model training, e.g. the relative abundance of a genus. |
+| **feature_set** | A named collection of features that can be used as model input, e.g. `tax_genus` (genus-level abundances) or `pathway_features_arithmetic_mean_none` (aggregated pathway features). Each feature set is a matrix of samples × features. |
+| **label** | The continuous target variable to predict, e.g. `temperature`, `ph`, or `oxygen`. One model is trained per label. |
+| **scheme** | The cross-validation partitioning strategy that defines how samples are assigned to folds, e.g. `random` (no grouping), `bioproject` (group by sequencing project), or `ecoregion` (group by biome). Grouped schemes prevent samples from the same group appearing in both train and validation splits. |
+| **fold** | A single train/validation split within a CV scheme. The number of folds is set by `n_folds` in `create_cv_folds`. |
+| **grouping** | A categorical sample attribute (e.g. `bioproject`, `biome`) used to define CV schemes or holdout splits, preventing data leakage across related samples. |
+| **holdout** | A reserved test set that is withheld from all CV training and used only for the final evaluation. Created via `create_holdout_split`. |
+| **CV_Result** | A container storing the outcome of one CV run for a specific (feature_set, label, scheme, model) combination, including per-fold metrics, the best estimator, and feature names. |
+| **HoldoutEvaluation** | The result of retraining the best CV configuration on the holdout-train split and evaluating on the holdout-test split. Contains predictions, targets, metrics, and feature names. |
+
+
 ## Quick Start
 
 ```python
@@ -292,22 +307,29 @@ if cv.best_model_estimator is not None and cv.best_result is not None:
 ```python
 from microbiome_ml import Visualiser
 
+# Default: saves as PNG only
 vis = Visualiser(out="out/figures")
 
-# CV bar plots: one PNG per feature_set / label / scheme / model
+# Save in multiple formats simultaneously
+vis = Visualiser(out="out/figures", formats=["png", "svg"])
+
+# All supported formats: "png", "svg", "eps", "pdf"
+vis = Visualiser(out="out/figures", formats=["png", "svg", "eps", "pdf"])
+
+# CV bar plots: one file per feature_set / label / scheme / model, in every format
 vis.plot_cv_bars(results="out/results")
 
 # Feature importance from best CV result
 if cv.best_result is not None:
     vis.plot_feature_importances(
         cv.best_result,
-        output="cv_feature_importance.png",
+        output="cv_feature_importance",   # extension is ignored; formats control output
     )
 
 # Feature importance from holdout evaluation
 vis.plot_feature_importances(
     evaluation,
-    output="holdout_feature_importance.png",
+    output="holdout_feature_importance",
 )
 
 # Holdout diagnostics: actual vs predicted + residual histogram
@@ -318,12 +340,15 @@ vis.visualise_model_performance(
     evaluation.targets,
     groups=groups,
     title="Holdout diagnostics",
-    file_name="holdout_diagnostics.png",
+    file_name="holdout_diagnostics",      # extension is ignored; formats control output
 )
 ```
 
 `plot_cv_bars` consumes a results NDJSON file or a directory containing
 `results.ndjson` / `best_result.ndjson` and writes one file per combination.
+All three plotting methods (`plot_cv_bars`, `plot_feature_importances`,
+`visualise_model_performance`) respect the `formats` list set on `Visualiser`,
+so each call produces one output file per format.
 
 ## Development
 

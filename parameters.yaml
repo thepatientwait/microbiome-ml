@@ -29,11 +29,6 @@ gb:
     - 1
   subsample:
     - 0.8
-en:
-  alpha:
-    - 0.1
-  l1_ratio:
-    - 0.1
 xgb:
   # n_estimators:
   #   - 100
