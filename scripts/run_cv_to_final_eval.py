@@ -239,6 +239,12 @@ def run_pipeline(
         )
         top_n = int(vis_cfg.get("top_n", 20))
 
+        LOGGER.info("Generating CV bar visualisations from %s", cv_out)
+        vis.plot_cv_bars(
+            results=cv_out,
+            out_dir=base_dir / "cv_visualisations",
+        )
+
         if isinstance(evaluation, dict):
             for label, ev in evaluation.items():
                 scheme = (
