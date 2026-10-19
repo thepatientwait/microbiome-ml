@@ -30,6 +30,27 @@ from microbiome_ml.wrangle.splits import SplitManager
 logger = logging.getLogger(__name__)
 
 
+def _as_rank(rank: Union[str, TaxonomicRanks]) -> TaxonomicRanks:
+    """Accept a rank as a name ('family'), a prefix ('f__' / 'f'), or enum."""
+    if isinstance(rank, TaxonomicRanks):
+        return rank
+    text = str(rank).strip().lower()
+    if not text:
+        raise ValueError("Rank must not be empty")
+    try:
+        return TaxonomicRanks.from_name(text)
+    except ValueError:
+        pass
+    prefix = text if text.endswith("__") else f"{text}__"
+    try:
+        return TaxonomicRanks.from_prefix(prefix)
+    except ValueError:
+        raise ValueError(
+            f"Invalid taxonomic rank {rank!r}; use a name like 'family' or "
+            "a prefix like 'f__'"
+        )
+
+
 class Dataset:
     """Global entry point for microbiome ML workflows with flexible builder
     pattern.
@@ -961,7 +982,7 @@ class Dataset:
             if overlap:
                 raise ValueError(f"Duplicate label columns: {overlap}")
             self.labels = self.labels.join(
-                new_df, on="sample", how="outer", coalesce=True
+                new_df, on="sample", how="full", coalesce=True
             )
 
         self._sync_accessions()
@@ -1029,7 +1050,7 @@ class Dataset:
                 raise ValueError(f"Duplicate grouping columns: {overlap}")
 
             self.groupings = self.groupings.join(
-                new_df, on="sample", how="outer", coalesce=True
+                new_df, on="sample", how="full", coalesce=True
             )
 
         self._sync_accessions()
@@ -1046,6 +1067,9 @@ class Dataset:
         ranks: Optional[List[Union[str, TaxonomicRanks]]] = None,
         prefix: str = "tax",
         all: bool = False,
+        stream_dir: Optional[Union[str, Path]] = None,
+        chunk_samples: int = 5000,
+        labelled_only: bool = False,
     ) -> "Dataset":
         """Generate FeatureSets from TaxonomicProfiles at specified ranks.
 
@@ -1053,6 +1077,14 @@ class Dataset:
             ranks: List of taxonomic ranks. Defaults to [TaxonomicRanks.CLASS] when
                    neither ``ranks`` nor ``all`` is specified.
             prefix: Prefix for generated feature set names (default: "tax")
+            stream_dir: Build each rank a chunk of samples at a time and
+                write it here as `<prefix>_<rank>.csv`, keeping a scan of
+                that file instead of the wide table. Peak memory becomes
+                chunk_samples x n_taxa. None builds in memory.
+            chunk_samples: Samples per chunk when streaming.
+            labelled_only: Build features only for samples that have a
+                non-null value for at least one label. Nothing downstream
+                uses an unlabelled sample's features.
             all: If True, run all standard ranks (phylum to species), ignoring
                  the ``ranks`` argument. Defaults to False.
 
@@ -1094,10 +1126,50 @@ class Dataset:
 
         added_ranks: List[str] = []
 
+        # Only samples that are actually modelled, when asked: CV, the
+        # trainer and SHAP all work from labelled samples.
+        keep_samples: Optional[List[str]] = None
+        if labelled_only:
+            if self.labels is None:
+                logger.warning(
+                    "labelled_only=True but no labels are set; "
+                    "building features for every sample"
+                )
+            else:
+                value_cols = [c for c in self.labels.columns if c != "sample"]
+                # Annotated: to_list() is Any, so without this mypy keeps
+                # the declared Optional and flags the len() below.
+                labelled: List[str] = (
+                    self.labels.filter(
+                        pl.any_horizontal(
+                            [pl.col(c).is_not_null() for c in value_cols]
+                        )
+                    )
+                    .get_column("sample")
+                    .unique()
+                    .to_list()
+                )
+                keep_samples = labelled
+                logger.info(
+                    "labelled_only: building features for %d of %d samples",
+                    len(labelled),
+                    self.labels.height,
+                )
+
         # Generate feature sets for each requested rank
         for rank in ranks_list:
-            feature_set = self.profiles.create_features(rank)
             feature_name = f"{prefix}_{rank.name.lower()}"
+            stream_path = (
+                Path(stream_dir) / f"{feature_name}.csv"
+                if stream_dir is not None
+                else None
+            )
+            feature_set = self.profiles.create_features(
+                rank,
+                stream_path=stream_path,
+                chunk_samples=chunk_samples,
+                samples=keep_samples,
+            )
 
             if not feature_set.feature_names:
                 logger.warning(
@@ -1133,8 +1205,9 @@ class Dataset:
         self,
         groupings: Optional[List[str]] = None,
         force: bool = False,
+        strict: bool = False,
     ) -> "Dataset":
-        """Create default grouping columns from metadata fields.
+        """Create grouping columns from metadata fields.
 
         Automatically extracts common grouping variables from metadata for use
         in train/test splitting and analysis. Fields are extracted as-is without
@@ -1144,7 +1217,11 @@ class Dataset:
             groupings: List of specific groupings to create. If None, creates all
                       available default groupings: ['bioproject', 'biome', 'domain',
                       'ecoregion', 'year', 'month', 'climate', 'season']
-            force: If True, overwrite existing groupings. If False, merge with existing
+            force: If True, replace any existing groupings table. If False,
+                   merge into it; fields already present are left untouched.
+            strict: If True, raise ``ValueError`` when any requested field
+                    cannot be found in the metadata (instead of skipping it
+                    with a warning). Use this for user-specified groupings.
 
         Returns:
             Self for chaining
@@ -1156,11 +1233,17 @@ class Dataset:
             # Create only specific groupings
             dataset.create_default_groupings(groupings=['bioproject', 'biome'])
 
+            # Add user columns on top of existing groupings; fail if missing
+            dataset.create_default_groupings(
+                groupings=['depth_category'], strict=True
+            )
+
             # Overwrite existing groupings
             dataset.create_default_groupings(force=True)
 
         Raises:
-            ValueError: If metadata is not available
+            ValueError: If metadata is not available, or (with
+                ``strict=True``) if a requested field is missing.
         """
         if self.metadata is None:
             raise ValueError(
@@ -1180,12 +1263,28 @@ class Dataset:
         ]
 
         # Use provided list or defaults
-        fields_to_extract = (
+        fields_to_extract = list(
             groupings if groupings is not None else default_groupings
         )
 
-        # Try to extract each field, skip if not available
+        # When merging, leave fields that already exist alone so a user list
+        # may overlap the defaults without tripping the duplicate check.
+        if not force and self.groupings is not None:
+            existing = set(self.groupings.columns) - {"sample"}
+            already = [f for f in fields_to_extract if f in existing]
+            if already:
+                logger.info(
+                    "Grouping field(s) already present, skipping: %s", already
+                )
+            fields_to_extract = [
+                f for f in fields_to_extract if f not in existing
+            ]
+            if not fields_to_extract:
+                return self
+
+        # Try to extract each field; skip (or raise, if strict) if missing
         extracted_fields = []
+        missing_fields: List[str] = []
         for field in fields_to_extract:
             try:
                 # Use the new metadata API to get the field
@@ -1193,14 +1292,28 @@ class Dataset:
                 # Verify it has data by checking if we can collect at least one row
                 if field_data.head(1).collect().height > 0:
                     extracted_fields.append(field)
+                else:
+                    missing_fields.append(field)
             except AttributeError:
-                logger.warning(
-                    f"Field '{field}' not found in metadata, skipping"
-                )
+                missing_fields.append(field)
+                if not strict:
+                    logger.warning(
+                        f"Field '{field}' not found in metadata, skipping"
+                    )
             except Exception as e:
-                logger.warning(
-                    f"Could not extract field '{field}' from metadata: {e}"
-                )
+                missing_fields.append(field)
+                if not strict:
+                    logger.warning(
+                        f"Could not extract field '{field}' from metadata: {e}"
+                    )
+
+        if strict and missing_fields:
+            available = self.metadata.get_available_fields()
+            raise ValueError(
+                f"Grouping field(s) not found in metadata: {missing_fields}. "
+                f"Available metadata columns: {available.get('metadata')}; "
+                f"attribute keys: {available.get('attributes')}"
+            )
 
         if not extracted_fields:
             logger.warning(
@@ -1230,6 +1343,7 @@ class Dataset:
         grouping: Optional[str] = None,
         random_state: int = 42,
         force: bool = False,
+        output_dir: Optional[Union[str, Path]] = None,
     ) -> "Dataset":
         """Create holdout train/test splits for one or all labels.
 
@@ -1243,6 +1357,9 @@ class Dataset:
             grouping: Optional grouping column to prevent leakage
             random_state: Random seed for reproducibility
             force: If True, overwrite existing splits
+            output_dir: Optional directory. If given, each created holdout
+                split is written to ``<output_dir>/<label>/holdout.csv``
+                (see :meth:`save_holdout_splits`).
 
         Returns:
             Self for chaining
@@ -1277,7 +1394,20 @@ class Dataset:
                 )
                 continue
 
-            logger.info(f"Creating holdout split for label: {lbl}")
+            if grouping is not None:
+                logger.info(
+                    "Creating holdout split for label: %s, grouped by '%s' "
+                    "(each %s value goes wholly to train or wholly to test)",
+                    lbl,
+                    grouping,
+                    grouping,
+                )
+            else:
+                logger.info(
+                    "Creating holdout split for label: %s, stratified random "
+                    "(no grouping; groups may appear in both train and test)",
+                    lbl,
+                )
 
             # Initialize SplitManager if needed
             if lbl not in self.splits:
@@ -1318,7 +1448,402 @@ class Dataset:
                 metadata=metadata_df,
             )
 
+        if output_dir is not None:
+            self.save_holdout_splits(output_dir, label=label)
+
         return self
+
+    def _rank_feature_set(self, rank: TaxonomicRanks) -> str:
+        """Name of the feature set holding *rank* (e.g. 'tax_family')."""
+        suffix = f"_{rank.name.lower()}"
+        candidates = [
+            name for name in self.feature_sets if name.endswith(suffix)
+        ]
+        if not candidates:
+            raise ValueError(
+                f"No feature set for rank '{rank.name.lower()}'. Available: "
+                f"{sorted(self.feature_sets)}. Add it with "
+                "add_taxonomic_features(ranks=[...]) before splitting."
+            )
+        return sorted(candidates)[0]
+
+    def taxon_prevalence(
+        self,
+        rank: Union[str, TaxonomicRanks],
+        samples: Optional[List[str]] = None,
+        presence_threshold: float = 0.0,
+    ) -> pl.DataFrame:
+        """Prevalence of every taxon at *rank* across *samples*.
+
+        Args:
+            rank: Rank name ('family'), prefix ('f__'), or TaxonomicRanks.
+            samples: Restrict to these samples (default: all in the set).
+            presence_threshold: A taxon counts as present when its value is
+                strictly greater than this (default: any non-zero value).
+
+        Returns:
+            DataFrame {taxon, n_present, n_samples, prevalence}, most
+            prevalent first.
+        """
+        rank_enum = _as_rank(rank)
+        feature_name = self._rank_feature_set(rank_enum)
+        df = self.feature_sets[feature_name].to_df()
+        if samples is not None:
+            df = df.filter(pl.col("sample").is_in(samples))
+        n_samples = df.height
+        if n_samples == 0:
+            raise ValueError(
+                f"No samples left for rank '{rank_enum.name.lower()}'"
+            )
+        taxa = [c for c in df.columns if c != "sample"]
+        # Cast defensively: a feature table read from CSV can carry String
+        # columns where the values were empty in the inference window, and
+        # comparing those to a float raises. Nulls stay null, so a null
+        # never counts as present.
+        counts = df.select(
+            [
+                (pl.col(c).cast(pl.Float64, strict=False) > presence_threshold)
+                .sum()
+                .alias(c)
+                for c in taxa
+            ]
+        ).row(0)
+        return (
+            pl.DataFrame(
+                {
+                    "taxon": taxa,
+                    "n_present": list(counts),
+                }
+            )
+            .with_columns(
+                pl.lit(n_samples).alias("n_samples"),
+                (pl.col("n_present") / n_samples).alias("prevalence"),
+            )
+            .sort("prevalence", descending=True)
+        )
+
+    def _register_empty_holdout(
+        self,
+        label: str,
+        data: pl.DataFrame,
+        metadata: Optional[pl.DataFrame],
+    ) -> None:
+        """Record a zero-row holdout for a label that cannot be split.
+
+        The metadata-based path always leaves a SplitManager behind (an
+        all-null label yields a header-only holdout.csv), and
+        ``create_cv_folds(use_holdout=True)`` relies on that: a missing
+        SplitManager raises instead of skipping the label. Skipped taxon
+        holdouts register the same empty frame so one unusable label does
+        not abort the whole run.
+        """
+        if label not in self.splits:
+            self.splits[label] = SplitManager(label)
+        empty = data.head(0).select("sample", pl.lit("train").alias("split"))
+        self.splits[label].holdout = self.splits[label]._enrich_holdout(
+            holdout_df=empty,
+            data=data,
+            target_col=label,
+            metadata=metadata,
+            split_col_name="split",
+        )
+
+    def create_taxon_holdout_split(
+        self,
+        rank: Union[str, TaxonomicRanks],
+        label: Optional[str] = None,
+        test_size: float = 0.2,
+        presence_threshold: float = 0.0,
+        min_test_samples: int = 2,
+        force: bool = False,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> "Dataset":
+        """Hold out samples by presence/absence of one taxon at *rank*.
+
+        Instead of splitting on a metadata column, the test set is defined by
+        the community itself: the taxon at *rank* whose prevalence across the
+        labelled samples is closest to ``test_size`` is chosen, and the
+        samples carrying it (or lacking it, whichever lands nearer the
+        target) become the holdout. Training therefore never sees a community
+        containing that taxon, so the holdout asks whether the model
+        generalises to communities defined by a different membership.
+
+        Only samples with a non-null label are considered, so the profiles are
+        effectively filtered to the labelled rows first.
+
+        Args:
+            rank: Rank to split on: 'family', 'f__', or TaxonomicRanks.FAMILY.
+            label: Label to split. If None, splits every label separately
+                (each may end up with a different taxon).
+            test_size: Target fraction of samples in the holdout.
+            presence_threshold: A taxon counts as present above this value.
+            min_test_samples: Refuse a taxon that would leave fewer than this
+                many samples on either side of the split.
+            force: Overwrite an existing split for the label.
+            output_dir: If given, write the split(s) with
+                :meth:`save_holdout_splits`.
+
+        Returns:
+            Self for chaining.
+        """
+        if self.labels is None:
+            raise ValueError("Labels must be added before creating splits")
+        rank_enum = _as_rank(rank)
+        feature_name = self._rank_feature_set(rank_enum)
+        feature_df = self.feature_sets[feature_name].to_df()
+
+        all_label_cols = [c for c in self.labels.columns if c != "sample"]
+        if label is not None:
+            if label not in all_label_cols:
+                raise ValueError(f"Label '{label}' not found in labels")
+            label_list = [label]
+        else:
+            label_list = all_label_cols
+
+        metadata_df: Optional[pl.DataFrame] = None
+        if self.metadata is not None:
+            metadata_df = self.metadata.metadata.collect()
+
+        for lbl in label_list:
+            if lbl in self.splits and not force:
+                logger.warning(
+                    f"Split for '{lbl}' already exists. "
+                    "Use force=True to overwrite."
+                )
+                continue
+
+            # Labelled samples only, and only those with a profile.
+            data = self.labels.select(["sample", lbl]).drop_nulls(subset=[lbl])
+            data = data.filter(
+                pl.col("sample").is_in(feature_df["sample"].to_list())
+            )
+            n_samples = data.height
+            if n_samples < 2 * min_test_samples:
+                logger.warning(
+                    "Label '%s': only %d labelled samples with a profile; "
+                    "skipping taxon holdout",
+                    lbl,
+                    n_samples,
+                )
+                self._register_empty_holdout(lbl, data, metadata_df)
+                continue
+
+            prevalence = self.taxon_prevalence(
+                rank_enum,
+                samples=data["sample"].to_list(),
+                presence_threshold=presence_threshold,
+            )
+            # Presence -> test, or absence -> test: whichever prevalence puts
+            # closest to the requested test_size while leaving both sides
+            # above min_test_samples.
+            usable = prevalence.with_columns(
+                (pl.col("prevalence") - test_size).abs().alias("_d_present"),
+                ((1 - pl.col("prevalence")) - test_size)
+                .abs()
+                .alias("_d_absent"),
+            ).filter(
+                (pl.col("n_present") >= min_test_samples)
+                & (
+                    pl.col("n_samples") - pl.col("n_present")
+                    >= min_test_samples
+                )
+            )
+            if usable.height == 0:
+                logger.warning(
+                    "Label '%s': no %s taxon splits the %d samples with at "
+                    "least %d on each side; skipping taxon holdout",
+                    lbl,
+                    rank_enum.name.lower(),
+                    n_samples,
+                    min_test_samples,
+                )
+                self._register_empty_holdout(lbl, data, metadata_df)
+                continue
+
+            by_present = usable.sort(["_d_present", "taxon"]).row(
+                0, named=True
+            )
+            by_absent = usable.sort(["_d_absent", "taxon"]).row(0, named=True)
+            if by_present["_d_present"] <= by_absent["_d_absent"]:
+                chosen, presence_is_test = by_present, True
+                achieved = chosen["prevalence"]
+            else:
+                chosen, presence_is_test = by_absent, False
+                achieved = 1.0 - chosen["prevalence"]
+
+            taxon = chosen["taxon"]
+            present = feature_df.filter(
+                pl.col(taxon).cast(pl.Float64, strict=False)
+                > presence_threshold
+            )["sample"].to_list()
+            in_test = pl.col("sample").is_in(present)
+            if not presence_is_test:
+                in_test = ~in_test
+
+            logger.info(
+                "Creating holdout split for label: %s, by %s taxon '%s' "
+                "(%s -> test; %d/%d samples = %.1f%%, target %.1f%%)",
+                lbl,
+                rank_enum.name.lower(),
+                taxon,
+                "presence" if presence_is_test else "absence",
+                round(achieved * n_samples),
+                n_samples,
+                achieved * 100,
+                test_size * 100,
+            )
+
+            holdout_df = data.select(
+                "sample",
+                pl.when(in_test)
+                .then(pl.lit("test"))
+                .otherwise(pl.lit("train"))
+                .alias("split"),
+            )
+
+            if lbl not in self.splits:
+                self.splits[lbl] = SplitManager(lbl)
+            enriched = self.splits[lbl]._enrich_holdout(
+                holdout_df=holdout_df,
+                data=data,
+                target_col=lbl,
+                metadata=metadata_df,
+                split_col_name="split",
+            )
+            # _enrich_holdout selects a fixed column set, so record which
+            # taxon produced the split afterwards. holdout_taxon_presence is
+            # per sample: True when that sample carries the taxon. It is
+            # therefore constant within each side of the split and opposite
+            # between them, which is the whole point of the split.
+            self.splits[lbl].holdout = enriched.with_columns(
+                pl.lit(taxon).alias("holdout_taxon"),
+                pl.lit(rank_enum.name.lower()).alias("holdout_rank"),
+                pl.col("sample")
+                .is_in(present)
+                .alias("holdout_taxon_presence"),
+            )
+
+        if output_dir is not None:
+            self.save_holdout_splits(output_dir, label=label)
+
+        return self
+
+    def save_holdout_splits(
+        self,
+        output_dir: Union[str, Path],
+        label: Optional[str] = None,
+    ) -> Dict[str, Path]:
+        """Write holdout split(s) to ``<output_dir>/<label>/holdout.csv``.
+
+        The CSV layout matches what :meth:`save` writes under ``splits/``,
+        so a single holdout split can be persisted to a user-chosen
+        location without saving the whole dataset.
+
+        Args:
+            output_dir: Directory to write into (created if missing)
+            label: Specific label to write. If None, writes every label
+                that has a holdout split.
+
+        Returns:
+            Mapping of label -> path of the written ``holdout.csv``
+
+        Raises:
+            ValueError: If *label* is given but has no holdout split, or if
+                no holdout splits exist at all.
+        """
+        output_dir = Path(output_dir)
+
+        to_write: Dict[str, pl.DataFrame] = {}
+        if label is not None:
+            split_manager = self._require_split_manager(label)
+            if split_manager.holdout is None:
+                raise ValueError(
+                    f"Holdout split for '{label}' has not been created yet"
+                )
+            to_write[label] = split_manager.holdout
+        else:
+            for lbl, sm in self.splits.items():
+                if sm.holdout is not None:
+                    to_write[lbl] = sm.holdout
+            if not to_write:
+                raise ValueError(
+                    "No holdout splits to save; "
+                    "call create_holdout_split first"
+                )
+
+        written: Dict[str, Path] = {}
+        for lbl, holdout_df in to_write.items():
+            label_dir = output_dir / lbl
+            label_dir.mkdir(parents=True, exist_ok=True)
+            holdout_path = label_dir / "holdout.csv"
+            holdout_df.write_csv(holdout_path)
+            written[lbl] = holdout_path
+            logger.info(
+                "Saved holdout split for '%s' to %s", lbl, holdout_path
+            )
+
+        return written
+
+    def save_cv_folds(
+        self,
+        output_dir: Union[str, Path],
+        label: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Path]]:
+        """Write CV fold tables to ``<output_dir>/<label>/cv_<scheme>.csv``.
+
+        One CSV per scheme with columns ``sample, fold`` — the exact fold
+        membership CV was run on (only holdout-train samples when the folds
+        were created with ``use_holdout=True``). Same layout as
+        :meth:`save` uses under ``splits/``.
+
+        Args:
+            output_dir: Directory to write into (created if missing)
+            label: Specific label to write. If None, writes every label
+                that has at least one CV scheme.
+
+        Returns:
+            Mapping of label -> {scheme -> path of the written CSV}
+
+        Raises:
+            ValueError: If *label* is given but has no CV folds, or if no
+                CV folds exist at all.
+        """
+        output_dir = Path(output_dir)
+
+        to_write: Dict[str, Dict[str, pl.DataFrame]] = {}
+        if label is not None:
+            split_manager = self._require_split_manager(label)
+            if not split_manager.cv_schemes:
+                raise ValueError(
+                    f"CV folds for '{label}' have not been created yet"
+                )
+            to_write[label] = dict(split_manager.cv_schemes)
+        else:
+            for lbl, sm in self.splits.items():
+                if sm.cv_schemes:
+                    to_write[lbl] = dict(sm.cv_schemes)
+            if not to_write:
+                raise ValueError(
+                    "No CV folds to save; call create_cv_folds first"
+                )
+
+        written: Dict[str, Dict[str, Path]] = {}
+        for lbl, schemes in to_write.items():
+            label_dir = output_dir / lbl
+            label_dir.mkdir(parents=True, exist_ok=True)
+            written[lbl] = {}
+            for scheme_name, cv_df in schemes.items():
+                cv_path = label_dir / f"cv_{scheme_name}.csv"
+                cv_df.write_csv(cv_path)
+                written[lbl][scheme_name] = cv_path
+            logger.info(
+                "Saved %d CV scheme(s) for '%s' to %s",
+                len(schemes),
+                lbl,
+                label_dir,
+            )
+
+        return written
 
     def _require_split_manager(self, label: str) -> SplitManager:
         if label not in self.splits:
@@ -1826,12 +2351,44 @@ class Dataset:
 
             for name, feature_set in self.feature_sets.items():
                 fs_path = features_dir / f"{name}.csv"
-                feature_set.save(fs_path)
+                source = getattr(feature_set, "source_path", None)
+                same_file = False
+                if source is not None:
+                    try:
+                        same_file = Path(source).resolve() == fs_path.resolve()
+                    except OSError:
+                        same_file = False
+                if same_file:
+                    # Streamed straight here during feature building;
+                    # re-writing would read and overwrite the same file.
+                    logger.debug(
+                        "Feature set %s already at %s; not rewriting",
+                        name,
+                        fs_path,
+                    )
+                else:
+                    feature_set.save(fs_path)
                 manifest["components"]["features"][name] = {
                     "file": f"{name}.csv",
                     "n_samples": len(feature_set.accessions),
                     "n_features": len(feature_set.feature_names),
                 }
+                if not compress:
+                    # Hand the in-memory table back: from here the feature
+                    # set reads from the file just written, so a long-lived
+                    # process does not keep every wide table resident.
+                    # Skipped when compressing, since work_dir is deleted.
+                    try:
+                        self.feature_sets[name] = SampleFeatureSet.scan(
+                            fs_path, name=name
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        logger.debug(
+                            "Could not re-scan %s after saving (%s); "
+                            "keeping the in-memory copy",
+                            name,
+                            exc,
+                        )
 
         # Save labels
         if self.labels is not None:

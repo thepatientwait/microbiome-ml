@@ -43,7 +43,7 @@ import warnings
 from collections import Counter
 from pathlib import Path
 from textwrap import wrap
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import cmasher as cmr
 import matplotlib.gridspec as gridspec
@@ -64,6 +64,24 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 _VALID_FORMATS = {"png", "svg", "eps", "pdf"}
+
+# Categorical hues for stacked marks: matplotlib tab10, with its grey moved
+# last so that for <= 9 categories grey is free to mean "Other". Distinct
+# hues rather than steps of one ramp -- neighbouring steps of a continuous
+# colormap read as the same category once they are stacked together.
+_CATEGORICAL_HUES = (
+    "#1f77b4",  # blue
+    "#ff7f0e",  # orange
+    "#2ca02c",  # green
+    "#d62728",  # red
+    "#9467bd",  # purple
+    "#8c564b",  # brown
+    "#e377c2",  # pink
+    "#bcbd22",  # olive
+    "#17becf",  # cyan
+    "#7f7f7f",  # grey (last: only used at 10+ categories)
+)
+_OTHER_HUE = "#bdbdbd"  # lighter than tab10 grey, so the two never merge
 
 
 class Visualiser:
@@ -358,15 +376,19 @@ class Visualiser:
             ax.set_xticks(x)
 
             if show_values:
+                # Always inside the bar at its far end: just below the top
+                # for positive bars, just above the bottom for negative ones.
                 for xi, v in zip(x, folds):
-                    ax.text(
-                        xi,
-                        v,
+                    ax.annotate(
                         f"{v:.3f}",
+                        xy=(xi, v),
+                        xytext=(0, -3 if v >= 0 else 3),
+                        textcoords="offset points",
                         ha="center",
-                        va="bottom",
+                        va="top" if v >= 0 else "bottom",
                         fontsize=8,
-                        rotation=0,
+                        color="white",
+                        fontweight="bold",
                     )
 
             ax.legend(loc="best")
@@ -711,6 +733,212 @@ class Visualiser:
             self._save_fig(fig, file_path, dpi=300)
         plt.show()
 
+    def plot_holdout_distribution(
+        self,
+        holdout: Union[str, Path, pl.DataFrame],
+        label: Optional[str] = None,
+        grouping: Optional[str] = None,
+        bins: int = 30,
+        stat: Union[str, Sequence[str]] = ("count", "probability"),
+        max_categories: int = 10,
+        output: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compare the label distribution in holdout train vs test.
+
+        Two histograms side by side on shared bins, so a holdout can be
+        checked for representativeness: the shapes should match even
+        though the test side holds ~20% of the samples. Bars are stacked
+        by *grouping* (e.g. ``bioproject``) to show which groups make up
+        each part of the range -- the same categories and colours in both
+        panels.
+
+        Args:
+            holdout: ``holdout.csv`` path, or the DataFrame itself. Needs
+                a ``split`` column of train/test plus the label column.
+            label: Label column. Defaults to the first column that is
+                neither ``sample`` nor ``split`` (how the pipeline writes
+                holdout.csv).
+            grouping: Column to stack by. None = a single colour.
+            bins: Bin count, shared by both panels.
+            max_categories: Groups past the most common this many fold
+                into a grey "Other" (default 10 = the tab10 palette).
+                Categories are taken most-common first.
+            stat: One statistic, or several -- one row of panels each.
+                ``"count"`` shows raw numbers (the 80/20 size difference
+                stays visible); ``"probability"`` puts both sides on one
+                scale so the shapes can be compared. Default: both.
+            output: Output path stem; respects ``self.formats``.
+            title: Figure title.
+        """
+        if isinstance(holdout, (str, Path)):
+            holdout = pl.read_csv(holdout, infer_schema_length=10000)
+        if "split" not in holdout.columns:
+            raise ValueError("holdout must have a 'split' column")
+        if label is None:
+            rest = [c for c in holdout.columns if c not in ("sample", "split")]
+            if not rest:
+                raise ValueError("No label column found in holdout")
+            label = rest[0]
+        if label not in holdout.columns:
+            raise ValueError(f"Label '{label}' not in holdout columns")
+        if grouping is not None and grouping not in holdout.columns:
+            raise ValueError(f"Grouping '{grouping}' not in holdout columns")
+
+        df = holdout.filter(pl.col(label).is_not_null())
+        if df.height == 0:
+            logging.warning("No non-null '%s' values to plot", label)
+            return {
+                "label": label,
+                "n_train": 0,
+                "n_test": 0,
+                "ks": None,
+                "p": None,
+            }
+
+        # Shared bin edges, so the two panels are directly comparable.
+        values = df[label].cast(pl.Float64, strict=False).to_numpy()
+        edges = np.histogram_bin_edges(values[np.isfinite(values)], bins=bins)
+
+        # One category -> colour mapping for both panels; building it per
+        # panel would recolour a group that is absent from one side.
+        # Distinct hues, not steps of one ramp: stacked segments sit next
+        # to each other, and neighbouring steps of a continuous colormap
+        # are easy to read as the same category.
+        palette: Optional[dict] = None
+        hue_order: Optional[List[str]] = None
+        if grouping is not None:
+            cats = df[grouping].cast(pl.Utf8).fill_null("NA").to_list()
+            counts = Counter(cats)
+            keep = [c for c, _ in counts.most_common(max_categories)]
+            hue_order = list(keep)
+            colors = list(_CATEGORICAL_HUES)
+            palette = {
+                cat: colors[i % len(colors)] for i, cat in enumerate(keep)
+            }
+            if len(counts) > len(keep):
+                palette["Other"] = _OTHER_HUE
+                hue_order.append("Other")
+
+        # One row per requested stat: "count" keeps the raw numbers (and the
+        # 80/20 size difference) visible, "probability" puts both sides on
+        # one scale so the shapes can be compared. Asking for both is the
+        # honest default when n differs a lot between the sides.
+        stats_list = [stat] if isinstance(stat, str) else list(stat)
+        if not stats_list:
+            raise ValueError("stat must name at least one statistic")
+
+        n_rows = len(stats_list)
+        fig, axes = plt.subplots(
+            n_rows,
+            2,
+            figsize=(12, 4.5 * n_rows),
+            sharex=True,
+            sharey="row",
+            squeeze=False,
+        )
+        for row, this_stat in enumerate(stats_list):
+            for col, side in enumerate(("train", "test")):
+                ax = cast(plt.Axes, axes[row][col])
+                part = df.filter(pl.col("split") == side)
+                x = part[label].cast(pl.Float64, strict=False).to_numpy()
+                hue = None
+                if grouping is not None and palette is not None and len(x):
+                    # An empty panel would leave hue as an empty list,
+                    # which seaborn treats as "no hue" and then warns that
+                    # the palette is unused.
+                    raw = (
+                        part[grouping].cast(pl.Utf8).fill_null("NA").to_list()
+                    )
+                    hue = [c if c in palette else "Other" for c in raw]
+                sns.histplot(
+                    x=x,
+                    bins=edges,
+                    hue=hue,
+                    hue_order=hue_order if hue is not None else None,
+                    palette=palette if hue is not None else None,
+                    multiple="stack",
+                    stat=this_stat,
+                    common_norm=True,
+                    ec=None,
+                    alpha=1,
+                    # one legend for the whole figure
+                    legend=(row == 0 and side == "test" and hue is not None),
+                    ax=ax,
+                )
+                if len(x):
+                    ax.axvline(
+                        float(np.nanmedian(x)),
+                        color="#7272a1",
+                        linestyle="dashed",
+                        zorder=3,
+                    )
+                if row == 0:
+                    ax.set_title(
+                        f"{side}  (n={len(x)}"
+                        + (
+                            f", median={np.nanmedian(x):.3g}, "
+                            f"sd={np.nanstd(x):.3g})"
+                            if len(x)
+                            else ")"
+                        ),
+                        fontsize=10,
+                    )
+                ax.set_xlabel(label if row == n_rows - 1 else "")
+                ax.set_ylabel(this_stat if col == 0 else "")
+
+        # Do the two sides actually match? Report it rather than eyeball.
+        head = title or f"Holdout label distribution: {label}"
+        tr = df.filter(pl.col("split") == "train")[label].to_numpy()
+        te = df.filter(pl.col("split") == "test")[label].to_numpy()
+        stats: Dict[str, Any] = {
+            "label": label,
+            "n_train": int(len(tr)),
+            "n_test": int(len(te)),
+            "median_train": float(np.nanmedian(tr)) if len(tr) else None,
+            "median_test": float(np.nanmedian(te)) if len(te) else None,
+            "sd_train": float(np.nanstd(tr)) if len(tr) else None,
+            "sd_test": float(np.nanstd(te)) if len(te) else None,
+            "ks": None,
+            "p": None,
+        }
+        try:
+            from scipy.stats import ks_2samp
+
+            if len(tr) > 1 and len(te) > 1:
+                ks = ks_2samp(tr, te)
+                stats["ks"] = float(ks.statistic)
+                stats["p"] = float(ks.pvalue)
+                head += (
+                    f"   ·   KS={ks.statistic:.3f} (p={ks.pvalue:.3g})"
+                    "  —  larger KS = more shift between train and test"
+                )
+        except Exception:  # pragma: no cover - scipy optional at runtime
+            pass
+        fig.suptitle(head, fontsize=12)
+
+        legend_obj = cast(plt.Axes, axes[0][1]).get_legend()
+        # A legend only exists when the bars were stacked, which needs a
+        # grouping -- so the title is never None here.
+        if legend_obj is not None and grouping is not None:
+            legend_obj.set_bbox_to_anchor((1.02, 1))
+            legend_obj.set_title(grouping)
+        fig.tight_layout()
+
+        if output:
+            file_path = Path(output)
+            if (
+                file_path.parent in (Path(""), Path("."))
+                and not file_path.is_absolute()
+            ):
+                file_path = self.output_dir / file_path.stem
+            else:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path = file_path.with_suffix("")
+            self._save_fig(fig, file_path, dpi=300)
+        plt.show()
+        return stats
+
     def plot_feature_importances(
         self,
         model: Any,
@@ -850,6 +1078,185 @@ class Visualiser:
         plt.title(title)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
+
+        if output:
+            file_path = Path(output)
+            if (
+                file_path.parent in (Path(""), Path("."))
+                and not file_path.is_absolute()
+            ):
+                file_path = self.output_dir / file_path.stem
+            else:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path = file_path.with_suffix("")
+            self._save_fig(fig, file_path, dpi=300)
+        plt.show()
+
+    def plot_shap_summary(
+        self,
+        shap_result: Any,
+        style: str = "bar",
+        top_n: int = 20,
+        output: Optional[str] = None,
+        title: str = "SHAP Feature Importance",
+        X: Optional[np.ndarray] = None,
+    ) -> None:
+        """Plot a SHAP summary using one of two styles.
+
+        Accepted input for ``shap_result``:
+        - :class:`~microbiome_ml.train.shap_analysis.SHAPResult` (from
+          :meth:`SHAPAnalyser.compute` or ``HoldoutEvaluation.shap_result``).
+
+        Styles:
+
+        ``"bar"``
+            Horizontal bar chart of per-feature ``mean(|SHAP|)``. Bars are
+            coloured by ``shap_result.direction`` when available: blue for
+            features whose higher values push the prediction *up*, red for
+            those pushing it *down*, grey when direction is undefined.
+
+        ``"beeswarm"``
+            Scatter plot showing each sample's SHAP value per feature,
+            coloured by normalised feature value. Uses ``X`` if supplied,
+            else ``shap_result.X``; falls back to a plain scatter when
+            neither is available.
+
+        Args:
+            shap_result: A ``SHAPResult`` object.
+            style: ``"bar"`` (default) or ``"beeswarm"``.
+            top_n: Number of top features to display.
+            output: Optional output path stem (extension ignored; respects
+                ``self.formats``).
+            title: Figure title.
+            X: Feature matrix for colour-coded beeswarm. Defaults to
+                ``shap_result.X``; shape must match ``shap_values``.
+        """
+        # Duck-type: require shap_values, mean_abs_shap, feature_names.
+        if not all(
+            hasattr(shap_result, attr)
+            for attr in ("shap_values", "mean_abs_shap", "feature_names")
+        ):
+            logging.warning(
+                "shap_result does not look like a SHAPResult. Skipping."
+            )
+            return
+
+        shap_values: np.ndarray = np.asarray(shap_result.shap_values)
+        mean_abs: np.ndarray = np.asarray(shap_result.mean_abs_shap)
+        feature_names: List[str] = list(shap_result.feature_names)
+        direction_raw = getattr(shap_result, "direction", None)
+        direction: Optional[np.ndarray] = (
+            np.asarray(direction_raw, dtype=float)
+            if direction_raw is not None
+            else None
+        )
+        if X is None:
+            X = getattr(shap_result, "X", None)
+
+        # Select top-n by mean |SHAP|.
+        order = np.argsort(mean_abs)[::-1][:top_n]
+        order_asc = order[::-1]  # ascending for horizontal barh
+
+        top_names = [feature_names[i] for i in order_asc]
+        top_mean = mean_abs[order_asc]
+        top_shap = shap_values[:, order_asc]
+
+        if style == "bar":
+            fig, ax = plt.subplots(figsize=(9, max(4, len(top_names) * 0.4)))
+            pos_color, neg_color, na_color = "#5b8db8", "#c0504d", "#9e9e9e"
+            if direction is not None:
+                top_dir = direction[order_asc]
+                bar_colors: List[str] = [
+                    na_color
+                    if not np.isfinite(d)
+                    else (pos_color if d >= 0 else neg_color)
+                    for d in top_dir
+                ]
+            else:
+                bar_colors = [pos_color] * len(top_names)
+            ax.barh(top_names, top_mean, color=bar_colors, edgecolor="none")
+            ax.set_xlabel("mean(|SHAP value|)")
+            ax.set_title(title)
+            ax.grid(True, axis="x", alpha=0.3)
+            if direction is not None:
+                from matplotlib.patches import Patch
+
+                handles = [
+                    Patch(
+                        color=pos_color,
+                        label="higher value → higher prediction",
+                    ),
+                    Patch(
+                        color=neg_color,
+                        label="higher value → lower prediction",
+                    ),
+                ]
+                if any(not np.isfinite(d) for d in direction[order_asc]):
+                    handles.append(
+                        Patch(color=na_color, label="direction n/a")
+                    )
+                ax.legend(handles=handles, loc="lower right", fontsize="small")
+            plt.tight_layout()
+
+        elif style == "beeswarm":
+            fig, ax = plt.subplots(figsize=(9, max(4, len(top_names) * 0.5)))
+            y_ticks = np.arange(len(top_names))
+
+            if X is not None:
+                X_top = np.asarray(X)[:, order_asc]
+                # Normalise each feature to [0, 1] for colouring.
+                feat_min = X_top.min(axis=0)
+                feat_max = X_top.max(axis=0)
+                feat_range = np.where(
+                    feat_max > feat_min, feat_max - feat_min, 1.0
+                )
+                X_norm = (X_top - feat_min) / feat_range
+            else:
+                X_norm = None
+
+            cmap = plt.get_cmap("coolwarm")
+            for fi, yi in enumerate(y_ticks):
+                vals = top_shap[:, fi]
+                if X_norm is not None:
+                    colors = cmap(X_norm[:, fi])
+                else:
+                    colors = "#5b8db8"
+                # Jitter y positions slightly to reduce overplotting.
+                rng = np.random.default_rng(seed=fi)
+                jitter = rng.uniform(-0.2, 0.2, size=len(vals))
+                ax.scatter(
+                    vals,
+                    yi + jitter,
+                    c=colors,
+                    s=8,
+                    alpha=0.6,
+                    linewidths=0,
+                )
+
+            ax.set_yticks(y_ticks)
+            ax.set_yticklabels(top_names)
+            ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+            ax.set_xlabel("SHAP value")
+            ax.set_title(title)
+            if X_norm is not None:
+                sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
+                sm.set_array([])
+                fig.colorbar(
+                    sm,
+                    ax=ax,
+                    label="Feature value (normalised)",
+                    fraction=0.02,
+                    pad=0.01,
+                )
+            ax.grid(True, axis="x", alpha=0.3)
+            plt.tight_layout()
+
+        else:
+            logging.warning(
+                "Unknown SHAP plot style '%s'. Use 'bar' or 'beeswarm'.",
+                style,
+            )
+            return
 
         if output:
             file_path = Path(output)
