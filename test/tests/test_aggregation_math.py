@@ -130,6 +130,32 @@ def test_unweighted_methods_match_numpy(method):
         np.testing.assert_allclose(got[s], exp[s])
 
 
+def test_max_and_min_abundance_average_ties_deterministically():
+    profiles = pl.DataFrame(
+        {
+            "sample": ["T"] * 4,
+            "taxonomy": TAX[:4],
+            "relabund": [0.3, 0.3, 0.2, 0.2],
+        }
+    ).lazy()
+    for method, rows in (("max_abundance", [0, 1]), ("min_abundance", [2, 3])):
+        outs = []
+        for _ in range(3):
+            cfg = AggregationConfig(
+                method=AggregationMethod(method),
+                weighting=WeightingStrategy.NONE,
+                uncommon_feature_cutoff=1,
+            )
+            df = (
+                FeatureAggregator()
+                .get_sample_features(_species_set(), profiles, cfg)
+                .collect()
+            )
+            outs.append(df.drop("acc").row(0))
+        assert outs[0] == outs[1] == outs[2]
+        np.testing.assert_allclose(outs[0], VALUES[rows].mean(axis=0))
+
+
 def test_presence_absence_is_per_feature_and_respects_min_abundance():
     got = _run(_species_set(), "presence_absence", "none", min_abundance=0.1)
     exp = _expected("presence_absence", "none", min_abundance=0.1)

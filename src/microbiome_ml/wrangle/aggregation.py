@@ -222,12 +222,18 @@ class FeatureAggregator:
         weighting: WeightingStrategy,
         **kwargs: Any,
     ) -> pl.LazyFrame:
-        """Max abundance aggregation (weighting not applicable)."""
+        """Features of the most abundant species (weighting not applicable).
+
+        When several species tie for the highest abundance (common with
+        rounded abundances) their features are averaged, so the result does
+        not depend on row order.
+        """
 
         agg_exprs = [
             pl.col(col)
             .filter(pl.col("relabund") == pl.col("relabund").max())
-            .first()
+            .mean()
+            .alias(col)
             for col in feature_cols
         ]
 
@@ -244,12 +250,16 @@ class FeatureAggregator:
         weighting: WeightingStrategy,
         **kwargs: Any,
     ) -> pl.LazyFrame:
-        """Min abundance aggregation (weighting not applicable)."""
+        """Features of the least abundant species (weighting not applicable).
+
+        Ties are averaged, as for ``max_abundance``.
+        """
 
         agg_exprs = [
             pl.col(col)
             .filter(pl.col("relabund") == pl.col("relabund").min())
-            .first()
+            .mean()
+            .alias(col)
             for col in feature_cols
         ]
 
