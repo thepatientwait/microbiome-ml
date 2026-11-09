@@ -25,6 +25,7 @@ from microbiome_ml.wrangle.features import (
 )
 from microbiome_ml.wrangle.metadata import SampleMetadata
 from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+from microbiome_ml.wrangle.species_table import LazySpeciesFeatureSet
 from microbiome_ml.wrangle.splits import SplitManager
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ class Dataset:
         self.profiles: Optional[TaxonomicProfiles] = None
         self.feature_sets: Dict[str, FeatureSet] = {}  # Sample-wise features
         self.species_feature_sets: Dict[
-            str, SpeciesFeatureSet
+            str, Union[SpeciesFeatureSet, LazySpeciesFeatureSet]
         ] = {}  # Species-wise features
         self.labels: Optional[pl.DataFrame] = None
         self.groupings: Optional[pl.DataFrame] = None
@@ -303,12 +304,18 @@ class Dataset:
     def add_species_features(
         self,
         name: str,
-        species_features: Optional[SpeciesFeatureSet] = None,
+        species_features: Optional[
+            Union[SpeciesFeatureSet, LazySpeciesFeatureSet]
+        ] = None,
         species_ids: Optional[List[str]] = None,
         feature_names: Optional[List[str]] = None,
         feature_array: Optional[np.ndarray] = None,
         data: Optional[Union[str, Path, pl.DataFrame, pl.LazyFrame]] = None,
         accession_col: str = "species",
+        lazy: bool = False,
+        taxonomy_map: Optional[
+            Union[str, Path, pl.DataFrame, pl.LazyFrame]
+        ] = None,
         **kwargs: Any,
     ) -> "Dataset":
         """Add species-wise feature set with flexible input handling.
@@ -321,6 +328,13 @@ class Dataset:
             feature_array: Feature data as numpy array
             data: DataFrame, LazyFrame, or CSV path with species features
             accession_col: Column name for species IDs in data (default: "species")
+            lazy: Keep ``data`` (a path) as a lazy scan instead of loading it
+                into memory. Parquet files/directories and CSVs are supported;
+                use this for genome-scale tables. ``accession_col`` is the key
+                column of the table.
+            taxonomy_map: With ``lazy=True``, a table (path or frame) with
+                ``acc`` and ``taxonomy`` columns that re-keys the table from
+                accession to taxonomy. It must be one-to-one.
             **kwargs: Additional parameters
 
         Returns:
@@ -339,8 +353,17 @@ class Dataset:
             # From CSV file
             .add_species_features("traits", data="species_traits.csv")
         """
-        if isinstance(species_features, SpeciesFeatureSet):
+        if isinstance(
+            species_features, (SpeciesFeatureSet, LazySpeciesFeatureSet)
+        ):
             self.species_feature_sets[name] = species_features
+        elif lazy and isinstance(data, (str, Path)):
+            self.species_feature_sets[name] = LazySpeciesFeatureSet.scan(
+                data,
+                name=name,
+                key_col=accession_col,
+                taxonomy_map=taxonomy_map,
+            )
         elif (
             species_ids is not None
             and feature_names is not None

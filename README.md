@@ -667,6 +667,41 @@ Related helper: `Dataset.taxon_prevalence(rank)` returns
 `{taxon, n_present, n_samples, prevalence}` so you can see the candidates
 before committing to a split.
 
+### Genome-scale species tables
+
+`SpeciesFeatureSet` holds its table as one dense numpy array, which does not
+fit hundreds of thousands of genomes by thousands of columns. Pass
+`lazy=True` to keep the table as a scan (a Parquet file, a directory of
+`*.parquet` files, or a CSV whose feature columns are read as `Float64`) and
+let the aggregation join it to the profiles without ever loading it whole:
+
+```python
+dataset.add_species_features(
+    "genome_spot",
+    data="species_v2/parquet/genome_spot",   # directory of *.parquet
+    accession_col="acc",                      # key column of the table
+    lazy=True,
+    taxonomy_map="globdb_species_map.csv",    # acc -> taxonomy (one-to-one)
+)
+dataset.aggregate_species_to_samples(
+    "genome_spot", method="geometric_mean", weighting="abundance",
+    chunk_columns=500,                        # aggregate 500 columns at a time
+)
+```
+
+The map re-keys the table from genome accession to the taxonomy string used
+by the profiles. It must be one-to-one: a taxonomy with several rows would be
+counted several times, so the scan raises unless `duplicate_taxa="mean"` is
+given to `LazySpeciesFeatureSet.scan`. `chunk_columns` bounds the width of
+each join; the result is identical to aggregating all columns at once.
+
+Aggregation notes: `presence_absence` is a per-feature 0/1 (some species above
+`min_abundance` has the feature > 0); species richness and total abundance are
+the separate `richness` method. A weighted `median` falls back to the weighted
+mean with a warning, so ask for it unweighted. `uncommon_feature_cutoff` drops
+sample-level features that are non-null in fewer samples than the cutoff (an
+int) or fewer than that fraction of samples (a float in (0, 1)).
+
 ### Keeping memory down on large data
 
 The expensive stage is `prepare`, and the expensive part of it is the pivot
