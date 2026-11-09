@@ -4,6 +4,7 @@ import json
 import logging
 import tarfile
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -50,6 +51,26 @@ def _as_rank(rank: Union[str, TaxonomicRanks]) -> TaxonomicRanks:
             f"Invalid taxonomic rank {rank!r}; use a name like 'family' or "
             "a prefix like 'f__'"
         )
+
+
+@dataclass
+class XY:
+    """Model-ready arrays for one feature set and label.
+
+    Attributes:
+        samples: Sample ids, in row order.
+        feature_names: Column names of ``X``.
+        X: Feature matrix (n_samples x n_features), nulls filled.
+        y: Label values.
+        groups: Grouping column name -> value per row (``None`` for a null
+            group), for the groupings that were requested.
+    """
+
+    samples: List[str]
+    feature_names: List[str]
+    X: np.ndarray
+    y: np.ndarray
+    groups: Dict[str, List[Any]] = field(default_factory=dict)
 
 
 class Dataset:
@@ -1948,6 +1969,94 @@ class Dataset:
         if metadata:
             return test_df
         return test_df.select("sample", "split", label)
+
+    def get_xy(
+        self,
+        feature_set: str,
+        label: str,
+        split: str = "train",
+        fillna: float = 0.0,
+        groupings: Optional[List[str]] = None,
+    ) -> XY:
+        """Return the arrays for one feature set and label.
+
+        Args:
+            feature_set: Name of a sample-level feature set.
+            label: Label name. Samples without a value are dropped.
+            split: ``"train"`` / ``"test"`` select the label's holdout split
+                (it must exist); ``"all"`` takes every labelled sample.
+            fillna: Value for missing (null or NaN) feature entries.
+            groupings: Grouping columns to return alongside (``groups``).
+
+        Only the rows of the selected samples are read from the feature set,
+        so a scan-backed feature set is never loaded whole.
+        """
+        if feature_set not in self.feature_sets:
+            raise ValueError(f"Feature set '{feature_set}' not found")
+        if self.labels is None or label not in self.labels.columns:
+            raise ValueError(f"Label '{label}' not found")
+        if split == "train":
+            chosen = self.get_train_samples(label, metadata=False)
+        elif split == "test":
+            chosen = self.get_test_samples(label, metadata=False)
+        elif split == "all":
+            chosen = self.labels.select("sample", label)
+        else:
+            raise ValueError("split must be 'train', 'test' or 'all'")
+        chosen = chosen.select("sample").unique(maintain_order=True)
+        lab = self.labels.select("sample", label).drop_nulls(label)
+        chosen = chosen.join(lab, on="sample", how="inner")
+
+        feat = self.feature_sets[feature_set]
+        feat_lf = getattr(feat, "features", None)
+        if not isinstance(feat_lf, pl.LazyFrame):
+            feat_lf = feat.collect().lazy()
+        names = feat_lf.collect_schema().names()
+        acc_col = next((c for c in ("sample", "acc") if c in names), None)
+        if acc_col is None:
+            raise ValueError(
+                f"Feature set '{feature_set}' has no 'sample' or 'acc' column"
+            )
+        if acc_col != "sample":
+            feat_lf = feat_lf.rename({acc_col: "sample"})
+        cols = [c for c in names if c != acc_col]
+        if not cols:
+            raise ValueError(f"Feature set '{feature_set}' has no features")
+
+        frame = (
+            chosen.lazy()
+            .join(feat_lf, on="sample", how="left")
+            .with_columns(
+                [
+                    pl.col(c)
+                    .cast(pl.Float64)
+                    .fill_null(fillna)
+                    .fill_nan(fillna)
+                    for c in cols
+                ]
+            )
+            .collect()
+        )
+        groups: Dict[str, List[Any]] = {}
+        if groupings:
+            if self.groupings is None:
+                raise ValueError("No groupings on this dataset")
+            missing = [g for g in groupings if g not in self.groupings.columns]
+            if missing:
+                raise ValueError(f"Groupings not found: {missing}")
+            gframe = frame.select("sample").join(
+                self.groupings.select(["sample"] + list(groupings)),
+                on="sample",
+                how="left",
+            )
+            groups = {g: gframe[g].to_list() for g in groupings}
+        return XY(
+            samples=frame["sample"].to_list(),
+            feature_names=cols,
+            X=frame.select(cols).to_numpy().astype(float),
+            y=frame[label].to_numpy().astype(float),
+            groups=groups,
+        )
 
     def create_cv_folds(
         self,

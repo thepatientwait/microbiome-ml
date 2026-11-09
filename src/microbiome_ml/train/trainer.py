@@ -5,10 +5,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import polars as pl
-from scipy.stats import pearsonr
 from sklearn.base import clone
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+from microbiome_ml.train.metrics import regression_metrics
 from microbiome_ml.train.results import (
     CV_Result,
     HoldoutEvaluation,
@@ -449,34 +448,5 @@ class ModelTrainer:
     ) -> Dict[str, Optional[float]]:
         """Compute MAE/MSE/R²/Q² and Pearson correlation for the holdout test
         set."""
-        y_true_arr = np.asarray(y_true)
-        y_pred_arr = np.asarray(y_pred)
-        if y_true_arr.size == 0 or y_pred_arr.size == 0:
-            return {
-                "mae": None,
-                "mse": None,
-                "r2": None,
-                "q2": None,
-                "pcc": None,
-                "pval": None,
-            }
-
-        metrics: Dict[str, Optional[float]] = {}
-        metrics["mae"] = mean_absolute_error(y_true_arr, y_pred_arr)
-        metrics["mse"] = mean_squared_error(y_true_arr, y_pred_arr)
-        metrics["r2"] = r2_score(y_true_arr, y_pred_arr)
-
-        denom = ((y_true_arr - np.mean(y_true_arr)) ** 2).sum()
-        metrics["q2"] = (
-            1 - ((y_true_arr - y_pred_arr) ** 2).sum() / denom
-            if denom > 0
-            else None
-        )
-
-        try:
-            metrics["pcc"], metrics["pval"] = pearsonr(y_true_arr, y_pred_arr)
-        except Exception:
-            metrics["pcc"] = None
-            metrics["pval"] = None
-
-        return metrics
+        m = regression_metrics(y_true, y_pred)
+        return {k: v for k, v in m.items() if k != "n"}
