@@ -40,7 +40,6 @@ from sklearn.model_selection import (
 
 # from sklearn.linear_model import ElasticNet, LinearRegression
 # from sklearn.neural_network import MLPRegressor
-from xgboost import XGBRegressor
 
 from microbiome_ml.train.results import CV_Result, LabelSchemeKey
 from microbiome_ml.wrangle.dataset import Dataset
@@ -59,13 +58,25 @@ class ComboMeta(NamedTuple):
     feature_columns: List[str]
 
 
+def _make_xgb() -> Any:
+    """Build an XGBRegressor; xgboost is an optional dependency."""
+    try:
+        from xgboost import XGBRegressor
+    except ImportError as exc:  # pragma: no cover - depends on environment
+        raise ImportError(
+            "Model 'xgb' needs the optional dependency xgboost "
+            "(pixi: add `xgboost` to the environment)."
+        ) from exc
+    return XGBRegressor()
+
+
 # Mapping of model short names to their constructors
 # Canonical constructors keyed by short names (keeps compatibility with hyperparameters.yaml)
 # For now works with regressor models only (random forest, gradient boosting, xgboost)
 _MODEL_CONSTRUCTORS = {
     "rf": lambda: RandomForestRegressor(),
     "gb": lambda: GradientBoostingRegressor(),
-    "xgb": lambda: XGBRegressor(),
+    "xgb": _make_xgb,
 }
 
 # Alias lists map many human-friendly synonyms to the canonical short keys above
