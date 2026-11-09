@@ -41,6 +41,7 @@ from sklearn.model_selection import (
 # from sklearn.linear_model import ElasticNet, LinearRegression
 # from sklearn.neural_network import MLPRegressor
 
+from microbiome_ml.train import model_zoo as zoo
 from microbiome_ml.train.results import CV_Result, LabelSchemeKey
 from microbiome_ml.wrangle.dataset import Dataset
 
@@ -58,54 +59,12 @@ class ComboMeta(NamedTuple):
     feature_columns: List[str]
 
 
-def _make_xgb() -> Any:
-    """Build an XGBRegressor; xgboost is an optional dependency."""
-    try:
-        from xgboost import XGBRegressor
-    except ImportError as exc:  # pragma: no cover - depends on environment
-        raise ImportError(
-            "Model 'xgb' needs the optional dependency xgboost "
-            "(pixi: add `xgboost` to the environment)."
-        ) from exc
-    return XGBRegressor()
-
-
-# Mapping of model short names to their constructors
-# Canonical constructors keyed by short names (keeps compatibility with hyperparameters.yaml)
-# For now works with regressor models only (random forest, gradient boosting, xgboost)
+# Model constructors and aliases come from the model zoo (rf, gb, xgb, ridge,
+# en, mlp). Kept as module-level names for backward compatibility.
 _MODEL_CONSTRUCTORS = {
-    "rf": lambda: RandomForestRegressor(),
-    "gb": lambda: GradientBoostingRegressor(),
-    "xgb": _make_xgb,
+    name: (lambda _n=name: zoo.build(_n)) for name in zoo.MODEL_SPECS
 }
-
-# Alias lists map many human-friendly synonyms to the canonical short keys above
-_MODEL_ALIASES = {
-    "rf": [
-        "rf",
-        "r f",
-        "rforest",
-        "r forest",
-        "randomforest",
-        "random forest",
-        "random forest regressor",
-        "random-forest",
-        "random_forest",
-    ],
-    "gb": [
-        "gb",
-        "gradient boosting",
-        "gradient_boosting",
-        "gradient-boosting",
-        "gradientboosting",
-    ],
-    "xgb": [
-        "xgb",
-        "xgboost",
-        "x gboost",
-        "x g b",
-    ],
-}
+_MODEL_ALIASES = zoo.ALIASES
 
 
 def _coerce_param_grid(raw: Optional[object]) -> object:
@@ -121,13 +80,7 @@ def _coerce_param_grid(raw: Optional[object]) -> object:
 
 
 def _normalize_alias(name: str) -> str:
-    # Normalize a model alias by lowercasing and removing non-alphanumeric
-    # characters (except spaces), collapsing multiple spaces.
-    s = (name or "").lower()
-    # keep only alnum and spaces, collapse spaces
-    s = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in s)
-    s = " ".join(s.split())
-    return s
+    return zoo._normalise(name)
 
 
 def _resolve_model_alias(name: str) -> str:
@@ -136,18 +89,7 @@ def _resolve_model_alias(name: str) -> str:
 
     Raises ValueError if no match.
     """
-    if not isinstance(name, str):
-        raise ValueError(f"Model alias must be a string, got: {type(name)}")
-    norm = _normalize_alias(name)
-    # first try exact match against alias lists
-    for canon, aliases in _MODEL_ALIASES.items():
-        for a in aliases:
-            if _normalize_alias(a) == norm:
-                return canon
-    # fallback: allow direct canonical key (already normalized)
-    if norm in _MODEL_CONSTRUCTORS:
-        return norm
-    raise ValueError(f"Unknown model alias: {name}")
+    return zoo.resolve(name)
 
 
 # Define a CrossValidator class to handle cross-validation process
@@ -547,6 +489,7 @@ class CrossValidator:
                 grid = _coerce_param_grid(params_grid.get(model_key, [{}]))
                 for params in ParameterGrid(grid):
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
+                    params = zoo.prefix_params(model_key, params)
                     estimator.set_params(**params)
                     cvres = cross_validate(
                         estimator,
@@ -717,7 +660,10 @@ class CrossValidator:
             for model in self.models:
                 if isinstance(model, str):
                     model_key = _resolve_model_alias(model)
-                    grid = _coerce_param_grid(param_grids.get(model_key, [{}]))
+                    grid = zoo.prefix_grid(
+                        model_key,
+                        _coerce_param_grid(param_grids.get(model_key, [{}])),
+                    )
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                 else:
                     # estimator instance: prefer class-name key, then canonical short keys
