@@ -482,3 +482,23 @@ def test_leaf_only_profiles_are_filled_by_summing_descendants():
     phylum = profiles.create_features("phylum").collect()
     assert phylum["p__X"].to_list() == pytest.approx([0.5])
     assert phylum["p__Y"].to_list() == pytest.approx([0.5])
+
+
+def test_create_features_refuses_to_merge_taxa_sharing_a_name(tmp_path):
+    import polars as pl
+
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    rows = _filled_rows("S1", {"X/X1/o/f/g/s1": 0.5}) + [
+        # the same genus name under another family
+        ("S1", "d__A;p__X;c__X1;o__o;f__f2", 0.5),
+        ("S1", "d__A;p__X;c__X1;o__o;f__f2;g__g", 0.5),
+        ("S1", "d__A;p__X;c__X1;o__o;f__f2;g__g;s__s7", 0.5),
+    ]
+    df = pl.DataFrame(
+        rows, schema=["sample", "taxonomy", "relabund"], orient="row"
+    )
+    profiles = TaxonomicProfiles(df.lazy(), check_filled=False)
+    for kwargs in ({}, {"stream_path": tmp_path / "g.csv"}):
+        with pytest.raises(ValueError, match="more than one lineage"):
+            profiles.create_features("genus", **kwargs)

@@ -851,22 +851,26 @@ class TaxonomicProfiles:
         # abundance instead of the taxon's own.
         pattern = f"(?:^|;)({rank.prefix}[^;]+)$"
 
-        # Long-format view: one row per (sample, taxon at this rank).
+        # Long-format view: one row per (sample, taxon at this rank). ``path``
+        # keeps the full lineage so two lineages sharing a rank token can be
+        # told apart (see _check_unique_tokens).
         long_lf = (
             profiles_lf.with_columns(
-                pl.col("taxonomy").str.replace_all(r";\s+", ";")
+                pl.col("taxonomy").str.replace_all(r";\s+", ";").alias("path")
             )  # normalize
             .with_columns(
-                pl.col("taxonomy").str.extract(pattern).alias("taxonomy")
+                pl.col("path").str.extract(pattern).alias("taxonomy")
             )
             .filter(pl.col("taxonomy").is_not_null())
-            .select(["sample", "taxonomy", "relabund"])
+            .select(["sample", "taxonomy", "relabund", "path"])
         )
         if samples is not None:
             long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
 
         if stream_path is None:
-            features = long_lf.collect().pivot(
+            long_df = long_lf.collect()
+            self._check_unique_tokens(long_df.select("taxonomy", "path"), rank)
+            features = long_df.drop("path").pivot(
                 values="relabund",
                 index="sample",
                 on="taxonomy",
@@ -884,6 +888,28 @@ class TaxonomicProfiles:
             id_column=id_column,
         )
 
+    @staticmethod
+    def _check_unique_tokens(pairs: pl.DataFrame, rank: TaxonomicRanks) -> None:
+        """Raise if one rank token occurs under several lineages.
+
+        Feature columns are named by the rank token (``g__Foo``). If two
+        different lineages carried the same token their abundances would be
+        silently merged into one column.
+        """
+        dup = (
+            pairs.unique()
+            .group_by("taxonomy")
+            .agg(pl.col("path").n_unique().alias("n"))
+            .filter(pl.col("n") > 1)
+        )
+        if dup.height:
+            examples = dup.get_column("taxonomy").head(3).to_list()
+            raise ValueError(
+                f"{dup.height} {rank.name.lower()} name(s) occur under more "
+                f"than one lineage (e.g. {examples}); the feature columns "
+                "would merge distinct taxa"
+            )
+
     def _stream_features(
         self,
         long_lf: pl.LazyFrame,
@@ -899,14 +925,10 @@ class TaxonomicProfiles:
         alive at a time. Each chunk is reindexed onto the full column
         list so every appended block has the same schema.
         """
-        taxa = (
-            long_lf.select("taxonomy")
-            .unique()
-            .collect()
-            .get_column("taxonomy")
-            .sort()
-            .to_list()
-        )
+        pairs = long_lf.select("taxonomy", "path").unique().collect()
+        self._check_unique_tokens(pairs, rank)
+        taxa = pairs.get_column("taxonomy").unique().sort().to_list()
+        long_lf = long_lf.select(["sample", "taxonomy", "relabund"])
         sample_ids = (
             long_lf.select("sample")
             .unique()
