@@ -24,5 +24,6 @@ __all__ = [
     "get_logger",
 ]
 
-# Configure default logging
-setup_logging()
+# Importing the package does not configure logging: that is the application's
+# job (a Snakemake job, a script or a notebook). Call ``setup_logging()`` or
+# use ``tee_log(path)`` from a command-line entry point.

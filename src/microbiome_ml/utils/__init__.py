@@ -1,6 +1,6 @@
 """Generic utilities for microbiome ML workflows."""
 
-from .logging import get_logger, setup_logging
+from .logging import get_logger, setup_logging, tee_log
 from .taxonomy import TaxonomicRanks
 
 # Labeling utilities (if available)
@@ -10,6 +10,7 @@ __all__ = [
     "TaxonomicRanks",
     "setup_logging",
     "get_logger",
+    "tee_log",
     # "GenericLabeler",
     # "join_dataframes",
 ]
