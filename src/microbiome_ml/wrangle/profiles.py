@@ -377,6 +377,7 @@ class TaxonomicProfiles:
         parent_rank: Optional[TaxonomicRanks],
         child_rank: TaxonomicRanks,
         sample_size: int = 1000,
+        rounding_tol: float = 5e-4,
     ) -> bool:
         """Check if profiles are filled for a specific parent/child rank pair.
 
@@ -384,6 +385,8 @@ class TaxonomicProfiles:
             parent_rank: Parent taxonomic rank
             child_rank: Child taxonomic rank
             sample_size: Maximum number of samples to check
+            rounding_tol: Largest rounding error of one abundance value (half
+                a unit of the last kept decimal; 5e-4 for three decimals)
 
         Returns:
             True if profiles are filled for this rank pair
@@ -424,25 +427,43 @@ class TaxonomicProfiles:
             ]
         ).filter(pl.col("parent_taxonomy").is_not_null())
 
-        # Sum child abundances by parent/sample
+        # A filled profile has a row for every ancestor of every taxon, and
+        # a parent's abundance is at least the sum of its children's. Both are
+        # tested. Abundances are routinely rounded (e.g. to three decimals),
+        # so the sum may exceed the parent by the rounding error of the
+        # parent and of each child: judging that "unfilled" would fill the
+        # profile again and add the descendants a second time.
+        parent_keys = parents.select(
+            ["sample", pl.col("taxonomy").alias("parent_taxonomy")]
+        ).unique()
+        orphans = (
+            children.select(["sample", "parent_taxonomy"])
+            .unique()
+            .join(parent_keys, on=["sample", "parent_taxonomy"], how="anti")
+        )
+        if orphans.collect().height > 0:
+            return False
+
         child_sums = children.group_by(["sample", "parent_taxonomy"]).agg(
-            pl.col(abundance_col).sum().alias("child_sum")
+            pl.col(abundance_col).sum().alias("child_sum"),
+            pl.len().alias("n_children"),
         )
-
-        # Prepare parent abundances
-        parents = parents.select(["sample", "taxonomy", abundance_col]).rename(
-            {"taxonomy": "parent_taxonomy", abundance_col: "parent_abundance"}
+        parent_abundance = parents.select(
+            [
+                "sample",
+                pl.col("taxonomy").alias("parent_taxonomy"),
+                pl.col(abundance_col).alias("parent_abundance"),
+            ]
         )
-
-        # Join and compare
-        comparison = parents.join(
-            child_sums, on=["sample", "parent_taxonomy"], how="inner"
+        too_small = child_sums.join(
+            parent_abundance, on=["sample", "parent_taxonomy"], how="inner"
+        ).filter(
+            pl.col("parent_abundance")
+            < pl.col("child_sum")
+            - (pl.col("n_children") + 1) * rounding_tol
+            - 1e-10
         )
-        invalid = comparison.filter(
-            pl.col("parent_abundance") < (pl.col("child_sum") - 1e-10)
-        )
-        invalid_count = invalid.collect().height
-        return bool(invalid_count == 0)
+        return bool(too_small.collect().height == 0)
 
     def _is_filled(self, sample_size: int = 1000) -> bool:
         """Check if profiles are in filled format.
@@ -517,8 +538,9 @@ class TaxonomicProfiles:
         if isinstance(rank, str):
             rank = TaxonomicRanks.from_name(rank)
 
-        rank_regex = rank.get_regex()
-        return lf.filter(pl.col("taxonomy").str.contains(rank_regex))
+        return lf.filter(
+            pl.col("taxonomy").str.contains(rank.get_exact_regex())
+        )
 
     def get_rank(self, rank: Union[str, TaxonomicRanks]) -> pl.LazyFrame:
         """Get entries for a specific taxonomic rank.
@@ -818,15 +840,17 @@ class TaxonomicProfiles:
                 "Profiles must be in relative abundance format to create features. Use _to_relabund_lf() first."
             )
 
-        # regex that captures the token at the requested rank anywhere in the taxonomy string
-        pattern = f"(?:^|;)((?:{rank.prefix}[^;]+))(?:;|$)"
+        # In a filled profile every rank has its own row whose taxonomy ENDS
+        # at that rank's token ("d__A;p__X" for phylum X, "d__A;p__X;c__Y"
+        # for class Y). Select only those rows: matching the token anywhere
+        # would also take the rows of all descendant taxa, and the pivot
+        # (aggregate "first") would then return an arbitrary descendant's
+        # abundance instead of the taxon's own.
+        pattern = f"(?:^|;)({rank.prefix}[^;]+)$"
 
         # Long-format view: one row per (sample, taxon at this rank).
         long_lf = (
-            profiles_lf.filter(
-                pl.col("taxonomy").str.contains(rank.get_regex())
-            )
-            .with_columns(
+            profiles_lf.with_columns(
                 pl.col("taxonomy").str.replace_all(r";\s+", ";")
             )  # normalize
             .with_columns(

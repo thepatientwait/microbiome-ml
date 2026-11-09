@@ -30,7 +30,7 @@ VALUES = np.array(
 PROFILES = {
     "A": {0: 0.5, 1: 0.3, 2: 0.2},
     "B": {0: 0.6, 2: 0.3, 3: 0.1},
-    "C": {1: 0.4, 3: 0.4, 4: 0.15, 5: 0.05},
+    "C": {1: 0.4, 3: 0.38, 4: 0.15, 5: 0.05},
 }
 NOT_IN_TABLE = "d__B;p__P;c__C;o__O;f__F;g__G;s__absent"
 
@@ -163,7 +163,7 @@ def test_richness_counts_species_with_features():
     assert df["acc"].to_list() == ["A", "B", "C"]
     assert df["richness"].to_list() == [3, 3, 3]  # absent species ignored
     np.testing.assert_allclose(
-        df["total_abundance"].to_numpy(), [1.0, 1.0, 0.95]
+        df["total_abundance"].to_numpy(), [1.0, 1.0, 0.93]
     )
 
 
