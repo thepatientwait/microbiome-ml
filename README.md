@@ -892,6 +892,39 @@ CV_Result.export_result(
 )
 ```
 
+### Feature selection
+
+`FeatureSelector` reduces a wide feature matrix before modelling. The default
+is **Boruta** (all-relevant selection against shuffled shadow features) around
+a depth-7 random forest, preceded by a prevalence filter (`min_prevalence`,
+default 0.05: features non-null in fewer samples are dropped) and an optional
+importance screen (`screen_top_k`) that keeps Boruta tractable for thousands of
+columns. Run it on the **training samples only** so the holdout test set never
+influences which features are kept:
+
+```python
+from microbiome_ml.train.feature_selection import (
+    FeatureSelector, select_features_for_dataset,
+)
+
+sel = select_features_for_dataset(
+    dataset, "tax_genus", "ph",
+    FeatureSelector(method="boruta", perc=85, n_jobs=8),
+)
+sel.selected                       # kept feature names
+sel.save("out/selection/tax_genus~ph.csv")   # per-feature table + .json
+
+cv = CrossValidator(
+    dataset, models=["rf"], label="ph",
+    feature_subset={"tax_genus::ph": sel.selected},   # or "tax_genus": [...]
+)
+```
+
+`ModelTrainer` refits the CV winner on exactly the columns it was
+cross-validated on. Boruta is an optional dependency (extra `selection`); it
+pins old numpy / scikit-learn, so install it in an isolated environment. The
+`"screen"` and `"none"` methods need only scikit-learn.
+
 ### Model types
 
 `models` takes short names (`"rf"`, `"gb"`, `"xgb"`, `"ridge"`, `"en"`,

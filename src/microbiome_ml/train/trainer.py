@@ -264,11 +264,12 @@ class ModelTrainer:
 
         feature_df = self._materialize_feature_set(feature_set_name)
 
+        cv_columns = best_result.feature_names or None
         X_train, y_train, feature_cols = self._assemble_split(
-            feature_df, train_df, label_name
+            feature_df, train_df, label_name, cv_columns
         )
         X_test, y_test, _ = self._assemble_split(
-            feature_df, test_df, label_name
+            feature_df, test_df, label_name, cv_columns
         )
 
         estimator = self._clone_estimator(best_result)
@@ -404,10 +405,26 @@ class ModelTrainer:
         return feature_df
 
     def _assemble_split(
-        self, feature_df: pl.DataFrame, split_df: pl.DataFrame, label: str
+        self,
+        feature_df: pl.DataFrame,
+        split_df: pl.DataFrame,
+        label: str,
+        columns: Optional[Sequence[str]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        """Produce the feature matrix and target array for a specific split."""
+        """Produce the feature matrix and target array for a specific split.
+
+        ``columns`` restricts (and orders) the feature columns, e.g. to the
+        ones a model was cross-validated on after feature selection.
+        """
         feature_cols = [col for col in feature_df.columns if col != "sample"]
+        if columns:
+            missing = [c for c in columns if c not in feature_cols]
+            if missing:
+                raise ValueError(
+                    f"Feature columns used in CV are missing from the feature "
+                    f"set: {missing[:5]}"
+                )
+            feature_cols = list(columns)
         if not feature_cols:
             raise ValueError(
                 "Feature set must provide at least one feature column"

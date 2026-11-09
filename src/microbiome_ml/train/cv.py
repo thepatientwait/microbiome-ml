@@ -109,6 +109,7 @@ class CrossValidator:
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
         feature_set: Optional[Union[str, List[str]]] = None,
+        feature_subset: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         if isinstance(dataset, Dataset):
             self.dataset = dataset
@@ -130,6 +131,11 @@ class CrossValidator:
         self.label: Optional[Union[str, List[str]]] = label
         self.scheme: Optional[Union[str, List[str]]] = scheme
         self.feature_set: Optional[Union[str, List[str]]] = feature_set
+        # Restrict the columns used per feature set (key ``"<feature_set>"``)
+        # or per feature set and label (key ``"<feature_set>::<label>"``, which
+        # wins), e.g. the output of FeatureSelector. Unlisted feature sets use
+        # all their columns.
+        self.feature_subset: Dict[str, List[str]] = dict(feature_subset or {})
         self._best_validation_r2: float = float("-inf")
         self.best_result_key: Optional[str] = None
         self.best_result: Optional[CV_Result] = None
@@ -149,6 +155,30 @@ class CrossValidator:
         self.best_model_estimator_by_label_scheme: Dict[
             LabelSchemeKey, Any
         ] = {}
+
+    def _columns_for(
+        self, feature_set: str, label: str, columns: List[str]
+    ) -> List[str]:
+        """Columns of ``feature_set`` to model for ``label`` (see
+        ``feature_subset``); keeps the table's column order."""
+        wanted = self.feature_subset.get(
+            f"{feature_set}::{label}", self.feature_subset.get(feature_set)
+        )
+        if wanted is None:
+            return columns
+        wanted_set = set(wanted)
+        missing = wanted_set - set(columns)
+        if missing:
+            raise ValueError(
+                f"feature_subset for '{feature_set}' names columns that are "
+                f"not in the feature set: {sorted(missing)[:5]}"
+            )
+        chosen = [c for c in columns if c in wanted_set]
+        if not chosen:
+            raise ValueError(
+                f"feature_subset for '{feature_set}' / '{label}' is empty"
+            )
+        return chosen
 
     def _reset_best_tracking(self) -> None:
         """Clear cached best-model selections before a fresh run."""
@@ -1064,6 +1094,9 @@ class CrossValidator:
                     # 3. Join labels and folds FIRST (both tiny), so the
                     # fold check can reject a combination before any
                     # feature data is read.
+                    cols_for = self._columns_for(
+                        feat_name, label_name, feature_cols
+                    )
                     ldf = label_df
                     label_value_col = next(
                         (c for c in ldf.columns if c != "sample"), None
@@ -1100,13 +1133,17 @@ class CrossValidator:
                     # copy per fit.
                     joined = (
                         keys.lazy()
-                        .join(feat_lf, on="sample", how="left")
+                        .join(
+                            feat_lf.select(["sample"] + cols_for),
+                            on="sample",
+                            how="left",
+                        )
                         .with_columns(
                             [
                                 pl.col(c)
                                 .fill_null(fillna)
                                 .cast(pl.Float32, strict=False)
-                                for c in feature_cols
+                                for c in cols_for
                             ]
                         )
                         .collect()

@@ -1975,7 +1975,7 @@ class Dataset:
         feature_set: str,
         label: str,
         split: str = "train",
-        fillna: float = 0.0,
+        fillna: Optional[float] = 0.0,
         groupings: Optional[List[str]] = None,
     ) -> XY:
         """Return the arrays for one feature set and label.
@@ -1985,7 +1985,9 @@ class Dataset:
             label: Label name. Samples without a value are dropped.
             split: ``"train"`` / ``"test"`` select the label's holdout split
                 (it must exist); ``"all"`` takes every labelled sample.
-            fillna: Value for missing (null or NaN) feature entries.
+            fillna: Value for missing (null or NaN) feature entries. ``None``
+                keeps them as NaN (needed to judge how many samples a feature
+                is present in, for example before feature selection).
             groupings: Grouping columns to return alongside (``groups``).
 
         Only the rows of the selected samples are read from the feature set,
@@ -2028,7 +2030,9 @@ class Dataset:
             .join(feat_lf, on="sample", how="left")
             .with_columns(
                 [
-                    pl.col(c)
+                    pl.col(c).cast(pl.Float64).fill_nan(None)
+                    if fillna is None
+                    else pl.col(c)
                     .cast(pl.Float64)
                     .fill_null(fillna)
                     .fill_nan(fillna)
