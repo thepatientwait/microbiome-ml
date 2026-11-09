@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
+import polars as pl
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,10 @@ class CV_Result:
         self.feature_names: List[str] = (
             list(feature_names) if feature_names is not None else []
         )
+
+        # Out-of-fold predictions (sample, fold, real, pred) for this result,
+        # filled by CrossValidator.add_oof_predictions for the winners.
+        self.oof_predictions: Optional[pl.DataFrame] = None
 
         # derived values
         self.avg_validation_r2: Optional[float] = None
@@ -535,6 +540,24 @@ class CV_Result:
         if fold_table:
             result_files.append("results_folds.csv")
         result_files.append("feature_importances.csv")
+
+        with_oof = {
+            k: r
+            for k, r in results_map.items()
+            if getattr(r, "oof_predictions", None) is not None
+        }
+        for key, result in with_oof.items():
+            if len(results_map) == 1:
+                oof_name = "oof_predictions.csv"
+            else:
+                oof_name = (
+                    f"oof/{Path(CV_Result._model_file_name(key)).stem}.csv"
+                )
+            oof_path = out_dir / oof_name
+            oof_path.parent.mkdir(parents=True, exist_ok=True)
+            assert result.oof_predictions is not None
+            result.oof_predictions.write_csv(oof_path)
+            result_files.append(oof_name)
 
         models_dir = out_dir / "models"
         model_files: List[str] = []

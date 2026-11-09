@@ -449,6 +449,66 @@ class CrossValidator:
         self._print_best_models_by_label()
         return results
 
+    def add_oof_predictions(
+        self,
+        oof_folds: Optional[int] = None,
+        seed: int = 0,
+        n_jobs: Optional[int] = None,
+    ) -> Dict[LabelSchemeKey, "pl.DataFrame"]:
+        """Attach out-of-fold predictions to the winner of every
+        (label, scheme).
+
+        Each sample of the scheme is predicted by the winning model refitted
+        on the other folds, giving the ``sample, fold, real, pred`` table the
+        downstream analyses (conformal intervals, hexbin plots, ensembles)
+        read. They are stored on ``result.oof_predictions`` and written as
+        ``oof_predictions.csv`` by the best-result exports.
+
+        Args:
+            oof_folds: ``None`` (default) uses the scheme's own folds. An
+                integer draws that many random folds instead (for example 10),
+                which reproduces a plain K-fold prediction on the same
+                samples.
+            seed: Seed for the random folds.
+            n_jobs: Parallel jobs for the predictions.
+
+        Returns:
+            The predictions keyed by (label, scheme).
+        """
+        from microbiome_ml.train.validation import out_of_fold_predictions
+
+        out: Dict[LabelSchemeKey, pl.DataFrame] = {}
+        for (label, scheme), result in self.best_result_by_label_scheme.items():
+            if result.model is None or result.feature_set is None:
+                continue
+            xy = self.dataset.get_xy(result.feature_set, str(label), "all")
+            scheme_df = self.dataset.splits[str(label)].cv_schemes[
+                str(scheme)
+            ]
+            fold_of = dict(
+                zip(scheme_df["sample"].to_list(), scheme_df["fold"].to_list())
+            )
+            keep = [i for i, s in enumerate(xy.samples) if s in fold_of]
+            samples = [xy.samples[i] for i in keep]
+            folds = (
+                None
+                if oof_folds
+                else np.array([fold_of[s] for s in samples], dtype=int)
+            )
+            oof = out_of_fold_predictions(
+                result.model,
+                xy.X[keep],
+                xy.y[keep],
+                samples=samples,
+                folds=folds,
+                n_splits=int(oof_folds or 10),
+                seed=seed,
+                n_jobs=n_jobs,
+            )
+            result.oof_predictions = oof
+            out[(label, scheme)] = oof
+        return out
+
     @staticmethod
     def _process_combo(
         payload: Tuple[

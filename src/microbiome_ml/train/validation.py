@@ -11,9 +11,11 @@ notebook, a test) and return polars frames in the ``acc,real,pred`` layout the
 downstream analyses read.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import polars as pl
@@ -27,6 +29,9 @@ from sklearn.model_selection import (
 
 from microbiome_ml.train import model_zoo as zoo
 from microbiome_ml.train.metrics import regression_metrics
+
+if TYPE_CHECKING:
+    from microbiome_ml.wrangle.dataset import Dataset
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +108,25 @@ class LogoResult:
     importances: Optional[pl.DataFrame] = None
     n_groups: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def save(self, directory: Union[str, Path], prefix: str = "logo") -> Path:
+        """Write the result as CSV/JSON files under ``directory``.
+
+        ``<prefix>_predictions.csv`` (sample, group, real, pred),
+        ``<prefix>_by_group.csv``, ``<prefix>_metrics.json`` and, when
+        available, ``<prefix>_importances.csv``.
+        """
+        out = Path(directory)
+        out.mkdir(parents=True, exist_ok=True)
+        self.predictions.write_csv(out / f"{prefix}_predictions.csv")
+        self.by_group.write_csv(out / f"{prefix}_by_group.csv")
+        record = {**self.metrics, "n_groups": self.n_groups, **self.extra}
+        (out / f"{prefix}_metrics.json").write_text(
+            json.dumps(record, indent=2, default=str)
+        )
+        if self.importances is not None:
+            self.importances.write_csv(out / f"{prefix}_importances.csv")
+        return out
 
 
 def leave_one_group_out(
@@ -203,3 +227,49 @@ def leave_one_group_out(
         importances=imp_df,
         n_groups=int(uniq.size),
     )
+
+
+def logo_for_dataset(
+    dataset: "Dataset",
+    feature_set: str,
+    label: str,
+    grouping: str,
+    estimator: Any,
+    split: str = "train",
+    importances: bool = True,
+    n_jobs: Optional[int] = None,
+    alternative: str = "two-sided",
+) -> LogoResult:
+    """Leave-one-group-out on a dataset's feature set and label.
+
+    Args:
+        dataset: Dataset with the feature set, label and grouping.
+        feature_set, label: What to model.
+        grouping: Grouping column to leave out (e.g. ``"bioproject"``).
+        estimator: Unfitted estimator, e.g. ``clone(result.model)`` of a CV
+            winner (it keeps the tuned hyperparameters).
+        split: ``"train"`` (the holdout-train samples, the default: the
+            holdout test set stays untouched), ``"test"`` or ``"all"``.
+    """
+    xy = dataset.get_xy(feature_set, label, split=split, groupings=[grouping])
+    result = leave_one_group_out(
+        estimator,
+        xy.X,
+        xy.y,
+        xy.groups[grouping],
+        samples=xy.samples,
+        feature_names=xy.feature_names,
+        importances=importances,
+        n_jobs=n_jobs,
+        alternative=alternative,
+    )
+    result.extra.update(
+        {
+            "feature_set": feature_set,
+            "label": label,
+            "grouping": grouping,
+            "split": split,
+            "n_samples": len(xy.y),
+        }
+    )
+    return result

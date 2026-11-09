@@ -228,3 +228,65 @@ def test_logo_on_dataset_arrays_end_to_end():
     )
     assert res.n_groups == len(set(d.groups["bioproject"]))
     assert res.metrics["r2"] > 0.9
+
+
+def test_cross_validator_out_of_fold_predictions_and_export(tmp_path):
+    import json
+
+    from microbiome_ml.train.cv import CrossValidator
+    from microbiome_ml.train.results import CV_Result
+
+    ds = _dataset_with_split()
+    ds.create_cv_folds(
+        label="y", n_folds=4, grouping="bioproject", use_holdout=True
+    )
+    params = tmp_path / "p.json"
+    params.write_text(json.dumps({"ridge": {"alpha": [0.1, 10.0]}}))
+    cv = CrossValidator(ds, models="ridge", label="y", scheme="bioproject")
+    cv.run(param_path=str(params), n_jobs=1)
+    out = cv.add_oof_predictions()
+    assert list(out) == [("y", "bioproject")]
+    oof = out[("y", "bioproject")]
+
+    train = set(ds.get_train_samples("y", metadata=False)["sample"].to_list())
+    assert set(oof["sample"].to_list()) == train
+    assert oof.columns == ["sample", "fold", "real", "pred"]
+    assert regression_metrics(oof["real"], oof["pred"])["r2"] > 0.9
+
+    # random K-fold predictions on the same samples
+    ten = cv.add_oof_predictions(oof_folds=10, seed=3)[("y", "bioproject")]
+    assert ten["fold"].n_unique() == 10
+    assert set(ten["sample"].to_list()) == train
+
+    CV_Result.export_best_results_by_scheme(
+        cv.best_result_by_label_scheme, tmp_path / "best"
+    )
+    csv = tmp_path / "best" / "y" / "bioproject" / "oof_predictions.csv"
+    assert csv.exists()
+    assert pl.read_csv(csv).height == len(train)
+
+
+def test_logo_for_dataset_and_save(tmp_path):
+    import json
+
+    from microbiome_ml.train.validation import logo_for_dataset
+
+    ds = _dataset_with_split()
+    res = logo_for_dataset(ds, "fs", "y", "bioproject", zoo.build("ridge"))
+    assert res.extra["split"] == "train"
+    assert res.extra["n_samples"] == len(res.predictions)
+    # the holdout test samples were not touched
+    test_ids = set(ds.get_test_samples("y", metadata=False)["sample"].to_list())
+    assert test_ids.isdisjoint(res.predictions["sample"].to_list())
+
+    out = res.save(tmp_path / "logo", prefix="y~fs")
+    names = sorted(p.name for p in out.iterdir())
+    assert names == [
+        "y~fs_by_group.csv",
+        "y~fs_importances.csv",
+        "y~fs_metrics.json",
+        "y~fs_predictions.csv",
+    ]
+    rec = json.loads((out / "y~fs_metrics.json").read_text())
+    assert rec["grouping"] == "bioproject" and rec["r2"] > 0.9
+    assert pl.read_csv(out / "y~fs_predictions.csv").height == len(res.predictions)
