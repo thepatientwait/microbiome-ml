@@ -40,12 +40,16 @@ def _scan_table(path: Union[str, Path], key_col: str) -> pl.LazyFrame:
     )
 
 
-def _as_lazy(table: MapInput, key_col: str) -> pl.LazyFrame:
+def _as_lazy(table: MapInput) -> pl.LazyFrame:
+    """A mapping table as a LazyFrame (plain scan: columns are text)."""
     if isinstance(table, pl.LazyFrame):
         return table
     if isinstance(table, pl.DataFrame):
         return table.lazy()
-    return _scan_table(table, key_col)
+    p = Path(table)
+    if p.suffix == ".parquet" or p.is_dir():
+        return _scan_table(p, "")
+    return pl.scan_csv(p)
 
 
 class LazySpeciesFeatureSet:
@@ -111,7 +115,7 @@ class LazySpeciesFeatureSet:
             return cls(lf.rename({key_col: TAXONOMY}), name, key_col=TAXONOMY)
 
         mapping = (
-            _as_lazy(taxonomy_map, map_key_col)
+            _as_lazy(taxonomy_map)
             .select(
                 pl.col(map_key_col).alias(key_col),
                 pl.col(map_taxonomy_col).alias(TAXONOMY),

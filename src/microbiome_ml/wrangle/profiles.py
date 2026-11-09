@@ -803,6 +803,7 @@ class TaxonomicProfiles:
         stream_path: Optional[Union[str, Path]] = None,
         chunk_samples: int = 5000,
         samples: Optional[List[str]] = None,
+        id_column: str = "sample",
     ) -> SampleFeatureSet:
         """Create a SampleFeatureSet from the taxonomic profiles at a rank.
 
@@ -819,6 +820,8 @@ class TaxonomicProfiles:
                 return a scan of it. None keeps the in-memory behaviour.
             chunk_samples: Samples per chunk when streaming.
             samples: Restrict to these samples (e.g. the labelled ones).
+            id_column: Name of the sample id column in a streamed CSV (the
+                in-memory path keeps ``sample``).
         Returns:
             SampleFeatureSet instance with features at the specified rank
         """
@@ -878,6 +881,7 @@ class TaxonomicProfiles:
             rank=rank,
             stream_path=Path(stream_path),
             chunk_samples=max(1, int(chunk_samples)),
+            id_column=id_column,
         )
 
     def _stream_features(
@@ -886,6 +890,7 @@ class TaxonomicProfiles:
         rank: TaxonomicRanks,
         stream_path: Path,
         chunk_samples: int,
+        id_column: str = "sample",
     ) -> SampleFeatureSet:
         """Pivot a rank to `stream_path` a chunk of samples at a time.
 
@@ -954,7 +959,7 @@ class TaxonomicProfiles:
                             for c in missing
                         ]
                     )
-                wide = wide.select(columns)
+                wide = wide.select(columns).rename({"sample": id_column})
                 wide.write_csv(handle, include_header=first)
                 first = False
                 del wide

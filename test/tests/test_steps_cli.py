@@ -1,0 +1,236 @@
+"""End-to-end tests of the file-based workflow steps and the CLI."""
+
+import pickle
+import subprocess
+import sys
+
+import numpy as np
+import polars as pl
+import pytest
+import yaml
+
+from microbiome_ml import steps
+from microbiome_ml.cli import main
+
+
+def _write_profiles(path, samples=("S1", "S2", "S3")):
+    prefixes = ["d", "p", "c", "o", "f", "g", "s"]
+    rows = []
+    leaves = {
+        "S1": {"X/X1/o/f/g/s1": 0.4, "X/X2/o/f/g/s2": 0.2, "Y/Y1/o/f/g/s3": 0.4},
+        "S2": {"X/X1/o/f/g/s1": 0.9, "Y/Y1/o/f/g/s3": 0.1},
+        "S3": {"Z/Z1/o/f/g/s9": 1.0},
+    }
+    for s in samples:
+        totals = {}
+        for leaf, v in leaves[s].items():
+            parts = ["A"] + leaf.split("/")
+            for d in range(1, 8):
+                key = ";".join(f"{prefixes[i]}__{parts[i]}" for i in range(d))
+                totals[key] = totals.get(key, 0.0) + v
+        rows += [(s, t, round(v, 6)) for t, v in totals.items()]
+    pl.DataFrame(rows, schema=["sample", "taxonomy", "relabund"], orient="row").write_csv(path)
+
+
+def test_rank_features_command(tmp_path):
+    prof = tmp_path / "p.csv"
+    _write_profiles(prof)
+    out = tmp_path / "out" / "phylum.csv"
+    rc = main(["rank-features", "--profiles", str(prof), "--rank", "phylum", "--out", str(out), "--chunk-samples", "2"])
+    assert rc == 0
+    df = pl.read_csv(out).sort("acc")
+    assert df.columns[0] == "acc"
+    assert sorted(df.columns[1:]) == ["p__X", "p__Y", "p__Z"]
+    assert df["p__X"].to_list() == [pytest.approx(0.6), pytest.approx(0.9), None]
+    assert df["p__Z"].to_list() == [None, None, 1.0]
+
+
+def test_aggregate_command_matches_numpy(tmp_path):
+    taxa = [f"d__A;p__P;c__C;o__O;f__F;g__G;s__sp{i}" for i in range(4)]
+    prof = pl.DataFrame(
+        {
+            "sample": ["A", "A", "A", "B", "B"],
+            "taxonomy": [taxa[0], taxa[1], taxa[2], taxa[0], taxa[3]],
+            "relabund": [0.5, 0.3, 0.2, 0.7, 0.3],
+        }
+    )
+    prof.write_csv(tmp_path / "rel.csv")
+    vals = np.array([[1.0, 0.0], [3.0, 2.0], [5.0, 4.0], [2.0, 8.0]])
+    sp = pl.DataFrame({"acc": [f"G{i}" for i in range(4)], "f1": vals[:, 0], "f2": vals[:, 1]})
+    sp.write_parquet(tmp_path / "sp.parquet")
+    pl.DataFrame({"acc": sp["acc"], "taxonomy": taxa}).write_csv(tmp_path / "map.csv")
+    out = tmp_path / "agg.csv"
+    rc = main(
+        [
+            "aggregate", "--profiles", str(tmp_path / "rel.csv"),
+            "--species-features", str(tmp_path / "sp.parquet"),
+            "--taxonomy-map", str(tmp_path / "map.csv"),
+            "--method", "arithmetic_mean", "--weighting", "abundance",
+            "--out", str(out), "--chunk-columns", "1",
+        ]
+    )
+    assert rc == 0
+    df = pl.read_csv(out).sort("acc")
+    a = (vals[[0, 1, 2]] * np.array([0.5, 0.3, 0.2])[:, None]).sum(0) / 1.0
+    b = (vals[[0, 3]] * np.array([0.7, 0.3])[:, None]).sum(0) / 1.0
+    np.testing.assert_allclose(df.drop("acc").to_numpy(), np.vstack([a, b]))
+
+
+def _metadata(n=160, seed=0):
+    rng = np.random.default_rng(seed)
+    acc = [f"S{i}" for i in range(n)]
+    x = rng.normal(size=(n, 8))
+    y = 2 * x[:, 0] - x[:, 1] + rng.normal(0, 0.2, n)
+    return acc, x, y, [f"bp{i // 8}" for i in range(n)]
+
+
+def test_partition_command_group_pure_and_columns(tmp_path):
+    acc, x, y, bp = _metadata()
+    meta = pl.DataFrame({"acc": acc, "bioproject": bp, "label~temp": y, "label~ph": [None] * 10 + list(y[10:])})
+    meta.write_csv(tmp_path / "meta.csv")
+    out = tmp_path / "part.csv"
+    rc = main(["partition", "--metadata", str(tmp_path / "meta.csv"), "--label", "label~temp", "label~ph", "--out", str(out)])
+    assert rc == 0
+    part = pl.read_csv(out)
+    assert part.columns == ["acc", "label~temp_partition", "label~ph_partition"]
+    j = meta.join(part, on="acc")
+    sides = j.group_by("bioproject").agg(pl.col("label~temp_partition").n_unique())
+    assert sides["label~temp_partition"].max() == 1
+    assert j.filter(pl.col("label~ph").is_null())["label~ph_partition"].null_count() == 10
+    assert set(part["label~temp_partition"].unique().to_list()) == {"train", "test"}
+
+
+def test_partition_unknown_label(tmp_path):
+    pl.DataFrame({"acc": ["a"], "bioproject": ["p"]}).write_csv(tmp_path / "m.csv")
+    with pytest.raises(ValueError, match="no label column"):
+        steps.partition_samples(tmp_path / "m.csv", ["zzz"], tmp_path / "o.csv")
+    assert main(["partition", "--metadata", str(tmp_path / "m.csv"), "--label", "zzz", "--out", str(tmp_path / "o.csv")]) == 1
+
+
+@pytest.fixture
+def model_files(tmp_path):
+    acc, x, y, bp = _metadata()
+    feats = pl.DataFrame({"acc": acc, **{f"f{i}": x[:, i] for i in range(8)}})
+    feats.write_csv(tmp_path / "features.csv")
+    meta = pl.DataFrame({"acc": acc, "bioproject": bp, "label~y": y})
+    meta.write_csv(tmp_path / "meta.csv")
+    main(["partition", "--metadata", str(tmp_path / "meta.csv"), "--label", "label~y", "--out", str(tmp_path / "part.csv")])
+    full = meta.join(pl.read_csv(tmp_path / "part.csv"), on="acc")
+    full.write_csv(tmp_path / "meta_full.csv")
+    return tmp_path
+
+
+def test_select_fit_logo_pipeline_schemas(model_files):
+    d = model_files
+    rc = main(
+        [
+            "select-features", "--features", str(d / "features.csv"),
+            "--metadata", str(d / "meta_full.csv"), "--label", "label~y",
+            "--partition", "label~y_partition", "--method", "screen",
+            "--screen-top-k", "3", "--out-train", str(d / "train.csv"),
+            "--out-test", str(d / "test.csv"), "--selection-table", str(d / "sel.csv"),
+        ]
+    )
+    assert rc == 0
+    train = pl.read_csv(d / "train.csv")
+    test = pl.read_csv(d / "test.csv")
+    assert train.columns[-2:] == ["target", "acc"]
+    assert train.columns[:-2] == test.columns[:-2]
+    assert set(train.columns[:-2]) == {"f0", "f1", train.columns[-3]}.union(set(train.columns[:-2]))
+    assert {"f0", "f1"} <= set(train.columns)
+    part = pl.read_csv(d / "part.csv")
+    assert set(train["acc"]) == set(part.filter(pl.col("label~y_partition") == "train")["acc"])
+    assert set(test["acc"]) == set(part.filter(pl.col("label~y_partition") == "test")["acc"])
+
+    grid = d / "grids.yaml"
+    grid.write_text(yaml.safe_dump({"ridge": {"alpha": [0.1, 10.0]}, "rf": {"n_estimators": [10]}}))
+    rc = main(
+        [
+            "fit", "--train", str(d / "train.csv"), "--test", str(d / "test.csv"),
+            "--model", "ridge", "--params-file", str(grid),
+            "--out-model", str(d / "m.pkl"), "--out-params", str(d / "best.yaml"),
+            "--out-predictions", str(d / "cv_pred.csv"),
+            "--out-test-predictions", str(d / "test_pred.csv"),
+            "--out-test-metrics", str(d / "test_metrics.csv"),
+            "--feature-label", "tax/genus", "--target-label", "y",
+        ]
+    )
+    assert rc == 0
+    best = yaml.safe_load((d / "best.yaml").read_text())
+    assert list(best) == ["model__alpha"]
+    cv_pred = pl.read_csv(d / "cv_pred.csv")
+    assert cv_pred.columns == ["acc", "real", "pred"] and cv_pred.height == train.height
+    metrics = pl.read_csv(d / "test_metrics.csv")
+    assert metrics.columns == ["model", "feature", "target", "mse", "r2", "q2", "pcc", "pval", "n_samples", "comment"]
+    assert metrics["feature"][0] == "tax/genus" and metrics["r2"][0] > 0.8
+    assert pl.read_csv(d / "test_pred.csv").height == test.height
+    with open(d / "m.pkl", "rb") as fh:
+        fitted = pickle.load(fh)
+    # the pickle loads and predicts on the test table's feature columns
+    Xt = test.drop(["acc", "target"])
+    assert fitted.predict(Xt).shape == (test.height,)
+
+    rc = main(
+        [
+            "logo", "--train", str(d / "train.csv"), "--metadata", str(d / "meta_full.csv"),
+            "--model", "ridge", "--params", str(d / "best.yaml"),
+            "--group-factor", "bioproject",
+            "--out-predictions", str(d / "logo_pred.csv"),
+            "--out-metrics", str(d / "logo_metrics.csv"),
+            "--out-importances", str(d / "logo_imp.csv"),
+            "--feature-label", "tax/genus", "--target-label", "y",
+        ]
+    )
+    assert rc == 0
+    lp = pl.read_csv(d / "logo_pred.csv")
+    assert lp.columns == ["acc", "group", "real", "pred"] and lp.height == train.height
+    lm = pl.read_csv(d / "logo_metrics.csv")
+    assert lm.columns == ["feature", "target", "model", "factor", "mse", "r2", "q2", "pcc", "pval", "n_samples", "comment"]
+    assert lm["factor"][0] == "bioproject" and lm["r2"][0] > 0.8
+    li = pl.read_csv(d / "logo_imp.csv")
+    assert li.columns == ["model", "feature", "target", "factor", "importance"]
+    assert li["importance"].sum() == pytest.approx(1.0)
+    assert (d / "logo_metrics_by_group.csv").exists()
+
+
+def test_cli_log_file_and_failure_exit_code(model_files):
+    d = model_files
+    log = d / "logs" / "fit.log"
+    run = lambda attempt: subprocess.run(  # noqa: E731
+        [
+            sys.executable, "-m", "microbiome_ml.cli",
+            "--log-file", str(log), "--attempt", str(attempt), "--log-label", "fit",
+            "fit", "--train", str(d / "nope.csv"), "--model", "rf",
+            "--out-model", str(d / "a"), "--out-params", str(d / "b"),
+            "--out-predictions", str(d / "c"),
+        ],
+        capture_output=True, text=True,
+    )
+    first = run(1)
+    assert first.returncode == 1
+    text = log.read_text()
+    assert "=== fit, attempt 1" in text and "fit failed" in text
+    assert "Traceback" in text
+    second = run(2)
+    assert second.returncode == 1
+    text2 = log.read_text()
+    assert "attempt 1" in text2 and "attempt 2" in text2  # retry appends
+
+
+def test_fit_with_rf_and_no_test(model_files):
+    d = model_files
+    main(["select-features", "--features", str(d / "features.csv"), "--metadata", str(d / "meta_full.csv"), "--label", "label~y", "--partition", "label~y_partition", "--method", "none", "--out-train", str(d / "train.csv"), "--out-test", str(d / "test.csv")])
+    grid = d / "g.yaml"
+    grid.write_text(yaml.safe_dump({"rf": {"n_estimators": [10], "max_features": [None]}}))
+    summary = steps.fit_table_model(d / "train.csv", "rf", yaml.safe_load(grid.read_text())["rf"], d / "m.pkl", d / "b.yaml", d / "p.csv", n_jobs=2)
+    assert "test" not in summary
+    assert summary["oof"]["r2"] > 0.6
+    assert yaml.safe_load((d / "b.yaml").read_text())["n_estimators"] == 10
+
+
+def test_module_entry_point_runs_as_a_subprocess(tmp_path):
+    out = subprocess.run([sys.executable, "-m", "microbiome_ml.cli", "--help"], capture_output=True, text=True)
+    assert out.returncode == 0
+    assert "rank-features" in out.stdout and "select-features" in out.stdout
+    bad = subprocess.run([sys.executable, "-m", "microbiome_ml.cli", "fit"], capture_output=True, text=True)
+    assert bad.returncode != 0

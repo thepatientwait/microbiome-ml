@@ -1,0 +1,520 @@
+"""Workflow steps on plain tables, with explicit inputs and outputs.
+
+Each function here is one rule of a file-based workflow (Snakemake, a shell
+script, a notebook): it reads CSV/Parquet files, calls the module, and writes
+files in a fixed layout. No function reads global state, so they are testable
+and importable; :mod:`microbiome_ml.cli` exposes them on the command line.
+
+Layouts (``acc`` is the sample id; ``target`` the label in model tables):
+
+* rank features      ``acc, <taxon>...``
+* sample features    ``acc, <feature>...``
+* partition table    ``acc, <label>_partition`` (``train`` / ``test`` / null)
+* selected features  ``<features...>, target, acc`` for train and test
+* CV / test / OOF predictions  ``acc, real, pred``
+* LOGO predictions   ``acc, group, real, pred``
+"""
+
+import logging
+import pickle
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Union
+
+import numpy as np
+import polars as pl
+import yaml
+
+from microbiome_ml.train import model_zoo as zoo
+from microbiome_ml.train.metrics import regression_metrics
+
+logger = logging.getLogger(__name__)
+
+PathLike = Union[str, Path]
+ID = "acc"
+TARGET = "target"
+
+
+# --------------------------------------------------------------------------
+# data wrangling
+# --------------------------------------------------------------------------
+def rank_features(
+    profiles: PathLike,
+    rank: str,
+    out: PathLike,
+    id_column: str = ID,
+    chunk_samples: int = 5000,
+    check_filled: bool = True,
+) -> Path:
+    """Relative abundance of every taxon at one rank, per sample.
+
+    ``profiles`` is a long table ``sample, taxonomy, relabund`` (a row per
+    taxon at every rank). The wide table is streamed to ``out`` a chunk of
+    samples at a time, so memory is ``chunk_samples x n_taxa``. Columns are
+    named by the rank token (``p__Acidobacteriota``); a sample without a taxon
+    has an empty cell.
+    """
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tp = TaxonomicProfiles(str(profiles), check_filled=check_filled)
+    tp.create_features(
+        rank,
+        stream_path=tmp,
+        chunk_samples=chunk_samples,
+        id_column=id_column,
+    )
+    tmp.replace(out_path)
+    logger.info("Wrote %s features to %s", rank, out_path)
+    return out_path
+
+
+def aggregate_features(
+    profiles: PathLike,
+    species_features: PathLike,
+    out: PathLike,
+    method: str = "arithmetic_mean",
+    weighting: str = "none",
+    taxonomy_map: Optional[PathLike] = None,
+    key_col: str = ID,
+    map_key_col: str = ID,
+    map_taxonomy_col: str = "taxonomy",
+    chunk_columns: Optional[int] = None,
+    uncommon_feature_cutoff: Union[int, float] = 0,
+    k: int = 10,
+    min_abundance: float = 0.001,
+) -> Path:
+    """Aggregate a species-level feature table to samples.
+
+    Args:
+        profiles: Species-level abundance table ``sample, taxonomy, relabund``.
+        species_features: Parquet file/dir or CSV of species features.
+        taxonomy_map: Optional ``acc, taxonomy`` table that re-keys the species
+            table from genome accession to taxonomy (must be one-to-one).
+        chunk_columns: Aggregate this many feature columns at a time.
+        uncommon_feature_cutoff: Drop features present in fewer samples than
+            this (int) or fraction of samples (float in (0, 1)); 0 keeps all.
+    """
+    from microbiome_ml.core.config import AggregationConfig
+    from microbiome_ml.wrangle.aggregation import FeatureAggregator
+    from microbiome_ml.wrangle.species_table import LazySpeciesFeatureSet
+
+    species = LazySpeciesFeatureSet.scan(
+        species_features,
+        name=Path(str(species_features)).stem,
+        key_col=key_col,
+        taxonomy_map=taxonomy_map,
+        map_key_col=map_key_col,
+        map_taxonomy_col=map_taxonomy_col,
+    )
+    rel = pl.scan_csv(str(profiles)).select("sample", "taxonomy", "relabund")
+    cfg = AggregationConfig(
+        method=method,  # type: ignore[arg-type]
+        weighting=weighting,  # type: ignore[arg-type]
+        uncommon_feature_cutoff=uncommon_feature_cutoff,
+        chunk_columns=chunk_columns,
+        k=k,
+        min_abundance=min_abundance,
+    )
+    result = FeatureAggregator().get_sample_features(species, rel, cfg)
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result.collect().write_csv(out_path)
+    logger.info("Wrote %s~%s features to %s", method, weighting, out_path)
+    return out_path
+
+
+def partition_samples(
+    metadata: PathLike,
+    label_columns: Sequence[str],
+    out: PathLike,
+    group_column: Optional[str] = "bioproject",
+    test_size: float = 0.2,
+    n_bins: int = 5,
+    seed: int = 42,
+    id_column: str = ID,
+    suffix: str = "_partition",
+) -> Path:
+    """Group-aware, label-stratified train/test partition for each label.
+
+    For each ``label_columns`` entry (a numeric column of ``metadata``) the
+    labelled samples are split into ``train`` / ``test`` so that whole groups
+    (e.g. a bioproject) fall on one side and every label bin keeps about
+    ``test_size`` of its samples in test. Samples without a value get an empty
+    partition. The output has ``acc`` and one ``<label><suffix>`` column per
+    label, ready to join onto the metadata.
+    """
+    from microbiome_ml.wrangle.splits import SplitManager
+
+    meta = pl.read_csv(str(metadata), infer_schema_length=10000)
+    if id_column not in meta.columns:
+        raise ValueError(f"metadata has no '{id_column}' column")
+    if group_column is not None and group_column not in meta.columns:
+        raise ValueError(f"metadata has no '{group_column}' column")
+    out_df = meta.select(id_column)
+    for label in label_columns:
+        if label not in meta.columns:
+            raise ValueError(f"metadata has no label column '{label}'")
+        cols = [id_column, label] + (
+            [group_column] if group_column is not None else []
+        )
+        data = (
+            meta.select(cols)
+            .rename({id_column: "sample"})
+            .with_columns(pl.col(label).cast(pl.Float64))
+            .drop_nulls(label)
+        )
+        sm = SplitManager(label)
+        sm.create_holdout(
+            data,
+            grouping=group_column,
+            test_size=test_size,
+            n_bins=n_bins,
+            random_state=seed,
+        )
+        assert sm.holdout is not None
+        part = sm.holdout.select(
+            pl.col("sample").alias(id_column),
+            pl.col("split").alias(f"{label}{suffix}"),
+        )
+        out_df = out_df.join(part, on=id_column, how="left")
+        logger.info(
+            "%s: %d train / %d test",
+            label,
+            int((part[f"{label}{suffix}"] == "train").sum()),
+            int((part[f"{label}{suffix}"] == "test").sum()),
+        )
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.write_csv(out_path)
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# model training
+# --------------------------------------------------------------------------
+def _feature_table(
+    features: PathLike,
+    metadata: PathLike,
+    label_col: str,
+    partition_col: str,
+    id_column: str = ID,
+) -> pl.LazyFrame:
+    """Lazy feature table joined with the label and its partition."""
+    path = str(features)
+    names = pl.read_csv(path, n_rows=0).columns
+    schema = {c: pl.Float32 for c in names if c not in (id_column, "sample")}
+    lf = pl.scan_csv(path, schema_overrides=schema)
+    meta = (
+        pl.scan_csv(str(metadata), infer_schema_length=10000)
+        .select(
+            pl.col(id_column),
+            pl.col(label_col).cast(pl.Float64).alias(TARGET),
+            pl.col(partition_col).alias("_partition"),
+        )
+        .drop_nulls([TARGET, "_partition"])
+    )
+    return lf.join(meta, on=id_column, how="inner")
+
+
+def select_features_table(
+    features: PathLike,
+    metadata: PathLike,
+    label_col: str,
+    partition_col: str,
+    out_train: PathLike,
+    out_test: PathLike,
+    method: str = "boruta",
+    min_prevalence: float = 0.05,
+    screen_top_k: Optional[int] = None,
+    perc: int = 85,
+    max_depth: int = 7,
+    random_state: int = 0,
+    n_jobs: int = 1,
+    id_column: str = ID,
+    selection_table: Optional[PathLike] = None,
+    chunk: int = 5000,
+) -> Dict[str, Any]:
+    """Select features on the train partition; write train and test tables.
+
+    Reads a wide ``acc, <features>`` table and the metadata (label and its
+    train/test partition). Prevalence and Boruta see **only the training
+    rows**. Writes ``<selected...>, target, acc`` for train and for test.
+    Absent entries (empty cells) count as absent for the prevalence filter and
+    are 0 in the written tables.
+    """
+    from microbiome_ml.train.feature_selection import FeatureSelector
+
+    lf = _feature_table(features, metadata, label_col, partition_col, id_column)
+    train_lf = lf.filter(pl.col("_partition") == "train")
+    cols = [
+        c
+        for c in lf.collect_schema().names()
+        if c not in (id_column, TARGET, "_partition")
+    ]
+    n_train = train_lf.select(pl.len()).collect().item()
+    if n_train == 0:
+        raise ValueError("No training samples after joining features and labels")
+
+    kept: List[str] = []
+    for i in range(0, len(cols), chunk):
+        part = cols[i : i + chunk]
+        counts = train_lf.select(
+            [pl.col(c).is_not_null().sum().alias(c) for c in part]
+        ).collect()
+        kept += [c for c in part if counts[c][0] / n_train >= min_prevalence]
+    if not kept:
+        logger.warning("No feature reaches the prevalence cutoff; keeping all")
+        kept = cols
+    logger.info("Prevalence >= %.3f: %d of %d features", min_prevalence, len(kept), len(cols))
+
+    train = (
+        train_lf.select([id_column, TARGET] + kept)
+        .with_columns([pl.col(c).fill_null(0.0).fill_nan(0.0) for c in kept])
+        .collect()
+    )
+    X = train.select(kept).to_numpy()
+    y = train[TARGET].to_numpy()
+    selector = FeatureSelector(
+        method=method,
+        min_prevalence=0.0,
+        screen_top_k=screen_top_k,
+        perc=perc,
+        max_depth=max_depth,
+        random_state=random_state,
+        n_jobs=n_jobs,
+    )
+    result = selector.select(X, y, kept)
+    selected = result.selected
+    if not selected:
+        raise ValueError("Feature selection kept no features")
+
+    test = (
+        lf.filter(pl.col("_partition") == "test")
+        .select([id_column, TARGET] + selected)
+        .with_columns([pl.col(c).fill_null(0.0).fill_nan(0.0) for c in selected])
+        .collect()
+    )
+    for df, path in ((train.select(selected + [TARGET, id_column]), out_train), (test.select(selected + [TARGET, id_column]), out_test)):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        df.write_csv(str(path))
+    if selection_table is not None:
+        result.save(selection_table)
+    logger.info(
+        "Selected %d features; train n=%d, test n=%d",
+        len(selected),
+        train.height,
+        test.height,
+    )
+    return {
+        "n_selected": len(selected),
+        "n_candidates": len(kept),
+        "n_train": train.height,
+        "n_test": test.height,
+    }
+
+
+def _read_model_table(path: PathLike, id_column: str = ID):
+    df = pl.read_csv(str(path))
+    return df.drop([id_column, TARGET]), df[TARGET], df[id_column]
+
+
+def fit_table_model(
+    train: PathLike,
+    model: str,
+    grid: Dict[str, Any],
+    out_model: PathLike,
+    out_params: PathLike,
+    out_predictions: PathLike,
+    test: Optional[PathLike] = None,
+    out_test_predictions: Optional[PathLike] = None,
+    out_test_metrics: Optional[PathLike] = None,
+    cv: int = 5,
+    oof_folds: int = 10,
+    seed: int = 0,
+    n_jobs: int = 1,
+    feature_label: str = "",
+    target_label: str = "",
+    id_column: str = ID,
+) -> Dict[str, Any]:
+    """Tune a model by K-fold grid search, then predict out-of-fold and test.
+
+    1. ``GridSearchCV`` over ``grid`` (hyperparameters under their natural
+       names; they are addressed for the model type) with ``cv`` shuffled
+       folds, refit on all training rows.
+    2. Out-of-fold predictions for the training rows with ``oof_folds``
+       shuffled folds and the best hyperparameters.
+    3. If ``test`` is given, predictions and metrics for the held-out rows.
+
+    Files: the fitted best estimator (pickle), the best parameters (YAML,
+    addressed as in the estimator), ``acc,real,pred`` for the out-of-fold and
+    test predictions, and a one-row metrics table.
+    """
+    from sklearn.base import clone
+    from sklearn.model_selection import GridSearchCV, KFold, cross_val_predict
+
+    model = zoo.resolve(model)
+    X, y, acc = _read_model_table(train, id_column)
+    estimator = zoo.build(model)
+    param_grid = zoo.prefix_grid(model, grid or {})
+    logger.info(
+        "Grid search for %s on %d samples x %d features",
+        model,
+        X.height,
+        X.width,
+    )
+    search = GridSearchCV(
+        estimator,
+        param_grid,
+        cv=KFold(cv, shuffle=True, random_state=seed),
+        n_jobs=n_jobs,
+        refit=True,
+    )
+    search.fit(X, y)
+    best_params = search.best_params_
+    best_model = search.best_estimator_
+    logger.info("Best hyperparameters: %s (score %.4f)", best_params, search.best_score_)
+
+    oof = cross_val_predict(
+        clone(estimator).set_params(**best_params),
+        X,
+        y,
+        cv=KFold(oof_folds, shuffle=True, random_state=seed),
+        n_jobs=n_jobs,
+    )
+
+    for path in (out_model, out_params, out_predictions):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"acc": acc, "real": y, "pred": oof}).write_csv(
+        str(out_predictions)
+    )
+    with open(out_params, "w") as fh:
+        yaml.dump(best_params, fh)
+    with open(out_model, "wb") as fh:
+        pickle.dump(best_model, fh)
+
+    summary: Dict[str, Any] = {
+        "best_params": best_params,
+        "cv_score": float(search.best_score_),
+        "oof": regression_metrics(y, oof),
+    }
+    if test is not None:
+        Xt, yt, acct = _read_model_table(test, id_column)
+        pred = best_model.predict(Xt)
+        m = regression_metrics(yt, pred, alternative="greater")
+        summary["test"] = m
+        if out_test_predictions is not None:
+            Path(out_test_predictions).parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame({"acc": acct, "real": yt, "pred": pred}).write_csv(
+                str(out_test_predictions)
+            )
+        if out_test_metrics is not None:
+            Path(out_test_metrics).parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame(
+                {
+                    "model": model,
+                    "feature": feature_label,
+                    "target": target_label,
+                    "mse": m["mse"],
+                    "r2": m["r2"],
+                    "q2": m["q2"],
+                    "pcc": m["pcc"],
+                    "pval": m["pval"],
+                    "n_samples": len(yt),
+                    "comment": "held-out validation",
+                }
+            ).write_csv(str(out_test_metrics))
+    return summary
+
+
+def logo_table(
+    train: PathLike,
+    metadata: PathLike,
+    model: str,
+    params: PathLike,
+    group_factor: str,
+    out_predictions: PathLike,
+    out_metrics: PathLike,
+    out_importances: PathLike,
+    feature_label: str = "",
+    target_label: str = "",
+    n_jobs: int = 1,
+    id_column: str = ID,
+) -> Optional[Dict[str, Any]]:
+    """Leave-one-group-out on a training table, with tuned hyperparameters.
+
+    ``params`` is the YAML written by :func:`fit_table_model`. ``metadata``
+    supplies ``group_factor`` per sample (rows without a group are dropped).
+    Returns ``None`` (and writes nothing) if there is only one group.
+    """
+    from microbiome_ml.train.validation import leave_one_group_out
+
+    model = zoo.resolve(model)
+    df = pl.read_csv(str(train)).unique(id_column, keep="first")
+    meta = pl.read_csv(str(metadata), infer_schema_length=10000).select(
+        pl.col(id_column), pl.col(group_factor).cast(pl.Utf8)
+    )
+    df = df.join(meta, on=id_column, how="inner").drop_nulls(group_factor)
+    if df[group_factor].n_unique() < 2:
+        logger.error("Only one group in %s; nothing to do", group_factor)
+        return None
+    with open(params) as fh:
+        hyper = yaml.safe_load(fh) or {}
+    estimator = zoo.build(model, **hyper)
+    features = [c for c in df.columns if c not in (id_column, TARGET, group_factor)]
+    res = leave_one_group_out(
+        estimator,
+        df.select(features).to_numpy(),
+        df[TARGET].to_numpy(),
+        df[group_factor].to_list(),
+        samples=df[id_column].to_list(),
+        feature_names=features,
+        n_jobs=n_jobs,
+        alternative="greater",
+    )
+    for path in (out_predictions, out_metrics, out_importances):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    res.predictions.rename({"sample": "acc"}).write_csv(str(out_predictions))
+    m = res.metrics
+    pl.DataFrame(
+        {
+            "feature": feature_label,
+            "target": target_label,
+            "model": model,
+            "factor": group_factor,
+            "mse": m["mse"],
+            "r2": m["r2"],
+            "q2": m["q2"],
+            "pcc": m["pcc"],
+            "pval": m["pval"],
+            "n_samples": int(df.height),
+            "comment": "",
+        },
+        schema_overrides={"n_samples": pl.Int32},
+    ).write_csv(str(out_metrics))
+    imp = res.importances
+    if imp is None:
+        imp = pl.DataFrame({"feature": [], "importance": []})
+    imp.with_columns(
+        pl.lit(model).alias("model"),
+        pl.lit(target_label).alias("target"),
+        pl.lit(group_factor).alias("factor"),
+    ).select("model", "feature", "target", "factor", "importance").write_csv(
+        str(out_importances)
+    )
+    by_group = Path(str(out_metrics)).with_name(
+        Path(str(out_metrics)).stem + "_by_group.csv"
+    )
+    res.by_group.write_csv(str(by_group))
+    return {"n_groups": res.n_groups, **res.metrics}
+
+
+__all__ = [
+    "rank_features",
+    "aggregate_features",
+    "partition_samples",
+    "select_features_table",
+    "fit_table_model",
+    "logo_table",
+]

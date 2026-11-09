@@ -46,6 +46,35 @@ Everything below is detail. The two sections to jump to are
 pipeline and [Parallel sweep with Snakemake](#parallel-sweep-with-snakemake-large-data)
 for the cluster workflow.
 
+## Workflow steps and command line
+
+For file-based workflows (Snakemake, shell, a scheduler) `microbiome_ml.steps`
+has one function per rule, with explicit inputs and outputs and fixed table
+layouts, and `python -m microbiome_ml.cli` exposes them:
+
+| command | does | main outputs |
+|---|---|---|
+| `rank-features` | taxon abundance at one rank, streamed | `acc, <taxon>...` |
+| `aggregate` | species features -> sample features (lazy, optional column chunks, accession -> taxonomy map) | `acc, <feature>...` |
+| `partition` | group-aware, label-stratified train/test per label | `acc, <label>_partition` |
+| `select-features` | prevalence filter + Boruta on the **train** rows | `<features>, target, acc` for train and test |
+| `fit` | K-fold grid search, out-of-fold and test predictions | pickle, best-params YAML, `acc,real,pred`, metrics |
+| `logo` | leave-one-group-out with the tuned parameters | `acc,group,real,pred`, metrics, importances |
+
+```bash
+python -m microbiome_ml.cli --log-file logs/fit.log --attempt 1 \
+  fit --train train.csv --test test.csv --model ridge \
+      --params-file hyperparameters.yaml \
+      --out-model m.pkl --out-params best.yaml --out-predictions cv.csv \
+      --out-test-predictions test.csv --out-test-metrics test_metrics.csv
+```
+
+`--log-file` sends stdout/stderr (including tracebacks and child processes)
+to the file: attempt 1 truncates it and later attempts append, each with a
+header line, which is the per-job log convention of the workflows. The exit
+status is non-zero on failure. Importing the CLI does not import scikit-learn
+or Boruta.
+
 ## Features
 
 - **Dataset Management**: Unified handling of taxonomic profiles, metadata, and labels with builder pattern API
