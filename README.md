@@ -892,6 +892,51 @@ CV_Result.export_result(
 )
 ```
 
+### Model types
+
+`models` takes short names (`"rf"`, `"gb"`, `"xgb"`, `"ridge"`, `"en"`,
+`"mlp"`) or scikit-learn estimators. `xgb` needs the optional `xgboost`
+package. `ridge`, `en` (elastic net) and `mlp` are wrapped in a median-impute
++ standardise pipeline (microbiome features span many orders of magnitude),
+and take their hyperparameters under the natural name in the parameter file
+(`alpha`, `l1_ratio`, ...); the module addresses them as `model__alpha`.
+`microbiome_ml.train.model_zoo` also provides normalised feature importances
+for every type, `fit_weighted` and `predict_with_spread` (per-tree spread of
+a forest, the basis for locally weighted conformal intervals).
+
+### Out-of-fold predictions and leave-one-group-out
+
+After a run, attach per-sample out-of-fold predictions to the winners:
+
+```python
+cv.run(param_path="parameters.yaml")
+cv.add_oof_predictions()               # predict each sample from the other folds
+cv.add_oof_predictions(oof_folds=10)   # ... or from 10 random folds instead
+CV_Result.export_best_results_by_scheme(
+    cv.best_result_by_label_scheme, "out/best"
+)   # writes <label>/<scheme>/oof_predictions.csv  (sample, fold, real, pred)
+```
+
+Leave-one-group-out (LOGO) holds out each group (a bioproject, an
+ecoregion, ...) in turn and predicts it from all the others, which measures
+how well the model transfers to groups it has never seen:
+
+```python
+from sklearn.base import clone
+from microbiome_ml.train.validation import logo_for_dataset
+
+best = cv.best_result_by_label_scheme[("ph", "random")]
+res = logo_for_dataset(
+    dataset, best.feature_set, "ph", grouping="bioproject",
+    estimator=clone(best.model),          # keeps the tuned hyperparameters
+)                                         # runs on the holdout-train samples
+res.metrics       # pooled n, mae, mse, rmse, r2, q2, pcc, pval
+res.by_group      # one row per held-out group: n, mae, rmse, bias, r2
+res.save("out/logo", prefix="ph~tax_genus")
+```
+
+`leave_one_group_out` and `out_of_fold_predictions` also take plain arrays.
+
 ### Picking the best: per label, per scheme
 
 After a run the winners are tracked at three levels:
