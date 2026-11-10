@@ -263,3 +263,69 @@ def test_logi_command_schemas(model_files):
     assert pl.read_csv(d / "hp.csv").columns == ["acc", "group", "real", "pred", "split_method"]
     assert pl.read_csv(d / "i.csv").columns == ["model", "feature", "target", "factor", "group", "importance"]
     assert m["factor"][0] == "eco" and set(m["group"].cast(pl.Utf8)) == set(meta["eco"].unique())
+
+
+def _annotation_world(tmp_path):
+    taxa = [f"d__A;p__P;c__C;o__O;f__F;g__G;s__sp{i}" for i in range(6)]
+    rows = [
+        ("G0", "K1", 2), ("G0", "K2", 1), ("G1", "K1", 1), ("G2", "K3", 4),
+        ("G3", "K2", 2), ("G3", "K3", 1), ("G4", "K1", 3), ("G5", "K9", 1),
+    ]
+    pl.DataFrame(rows, schema=["acc", "KEGG", "count"], orient="row").write_csv(tmp_path / "ann.csv")
+    pl.DataFrame({"acc": [f"G{i}" for i in range(6)], "taxonomy": taxa}).write_csv(tmp_path / "map.csv")
+    prof = [
+        ("S1", taxa[0], 0.5), ("S1", taxa[1], 0.3), ("S1", taxa[2], 0.2),
+        ("S2", taxa[3], 0.6), ("S2", taxa[4], 0.4),
+        ("S3", "d__A;p__P;c__C;o__O;f__F;g__G;s__unknown", 1.0),
+    ]
+    pl.DataFrame(prof, schema=["sample", "taxonomy", "relabund"], orient="row").write_csv(tmp_path / "rel.csv")
+    return taxa
+
+
+def test_aggregate_annotations_command(tmp_path):
+    _annotation_world(tmp_path)
+    out = tmp_path / "agg.csv"
+    rc = main(
+        [
+            "aggregate-annotations", "--profiles", str(tmp_path / "rel.csv"),
+            "--annotations", str(tmp_path / "ann.csv"), "--feature-col", "KEGG",
+            "--taxonomy-map", str(tmp_path / "map.csv"), "--min-prevalence", "0.2",
+            "--method", "arithmetic_mean", "--weighting", "abundance", "--out", str(out),
+            "--chunk-samples", "1",
+        ]
+    )
+    assert rc == 0
+    df = pl.read_csv(out).sort("acc")
+    # K1 in 3 of 6 genomes, K2 in 2, K3 in 2 (>= int(6*0.2) = 1); K9 in 1 -> kept too (1 >= 1)
+    assert df.columns == ["acc", "K1", "K2", "K3", "K9"]
+    # S1: genomes G0 (K1=2,K2=1), G1 (K1=1), G2 (K3=4) weighted 0.5/0.3/0.2
+    assert df.filter(pl.col("acc") == "S1").row(0) == pytest.approx(("S1", 0.5 * 2 + 0.3 * 1, 0.5 * 1, 0.2 * 4, 0.0))
+    assert df["acc"].to_list() == ["S1", "S2"]  # S3's species has no genome
+
+
+def test_kegg_completeness_command(tmp_path):
+    _annotation_world(tmp_path)
+    tax = pl.read_csv(tmp_path / "map.csv")
+    tsv = tmp_path / "tax.tsv"
+    # as shipped: tab separated, no header, spaces in the species name
+    tsv.write_text("".join(f"{a}\t{t.replace('_', ' ') if False else t}\n" for a, t in tax.iter_rows()))
+    (tmp_path / "mod").write_text("md:M1\tko:K1\nmd:M1\tko:K2\nmd:M2\tko:K3\nmd:M2\tko:K8\n")
+    (tmp_path / "path").write_text("path:map1\tko:K1\npath:map1\tko:K3\npath:ko9\tko:K1\n")
+    pl.DataFrame({"acc": ["S1", "S2"]}).write_csv(tmp_path / "samples.csv")
+    rc = main(
+        [
+            "kegg-completeness", "--profiles", str(tmp_path / "rel.csv"),
+            "--annotations", str(tmp_path / "ann.csv"), "--taxonomy", str(tsv),
+            "--modules", str(tmp_path / "mod"), "--pathways", str(tmp_path / "path"),
+            "--out-modules", str(tmp_path / "m.csv"), "--out-pathways", str(tmp_path / "p.csv"),
+            "--samples", str(tmp_path / "samples.csv"),
+        ]
+    )
+    assert rc == 0
+    m = pl.read_csv(tmp_path / "m.csv").sort("acc")
+    p = pl.read_csv(tmp_path / "p.csv").sort("acc")
+    # S1 has K1,K2,K3 in its genomes: M1 = 2/2, M2 = 1/2 ; S2 has K2,K3,K1 (G3: K2,K3; G4: K1)
+    assert set(m.columns) == {"acc", "M1", "M2"}
+    assert m.filter(pl.col("acc") == "S1").select("M1", "M2").row(0) == pytest.approx((1.0, 0.5))
+    assert m.filter(pl.col("acc") == "S2").select("M1", "M2").row(0) == pytest.approx((1.0, 0.5))
+    assert p.columns == ["acc", "map1"] and p["map1"].to_list() == pytest.approx([1.0, 1.0])

@@ -2,7 +2,8 @@
 
     python -m microbiome_ml.cli [--log-file LOG --attempt N] <command> ...
 
-Commands: ``rank-features``, ``aggregate``, ``partition``, ``select-features``,
+Commands: ``rank-features``, ``aggregate``, ``aggregate-annotations``,
+``kegg-completeness``, ``partition``, ``select-features``,
 ``fit``, ``logo`` and ``logi``. Each writes the files named on the command line, logs
 its progress and exits non-zero on error, so it drops straight into a
 workflow rule::
@@ -71,6 +72,41 @@ def _cmd_aggregate(a: argparse.Namespace) -> None:
         uncommon_feature_cutoff=cutoff,
         k=a.k,
         min_abundance=a.min_abundance,
+    )
+
+
+def _cmd_aggregate_annotations(a: argparse.Namespace) -> None:
+    from microbiome_ml import steps
+
+    steps.aggregate_annotation_features(
+        a.profiles,
+        a.annotations,
+        a.feature_col,
+        a.out,
+        method=a.method,
+        weighting=a.weighting,
+        taxonomy_map=a.taxonomy_map,
+        key_col=a.key_col,
+        value_col=a.value_col,
+        min_prevalence=a.min_prevalence,
+        chunk_samples=a.chunk_samples,
+        k=a.k,
+        min_abundance=a.min_abundance,
+    )
+
+
+def _cmd_kegg_completeness(a: argparse.Namespace) -> None:
+    from microbiome_ml import steps
+
+    steps.kegg_completeness_features(
+        a.profiles,
+        a.annotations,
+        a.taxonomy,
+        {"module": a.modules, "pathway": a.pathways},
+        {"module": a.out_modules, "pathway": a.out_pathways},
+        samples=a.samples,
+        keep_if_contains={"pathway": "map"},
+        chunk_samples=a.chunk_samples,
     )
 
 
@@ -218,6 +254,40 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--uncommon", type=float, default=0.0)
     s.add_argument("--k", type=int, default=10)
     s.add_argument("--min-abundance", type=float, default=0.001)
+
+    s = add(
+        "aggregate-annotations",
+        _cmd_aggregate_annotations,
+        "long genome annotations (eggNOG, KEGG) -> sample features",
+    )
+    s.add_argument("--profiles", required=True, help="species abundance CSV")
+    s.add_argument("--annotations", required=True, help="long CSV/parquet")
+    s.add_argument("--feature-col", required=True, help="e.g. KEGG, eggNOG_OGs")
+    s.add_argument("--out", required=True)
+    s.add_argument("--method", default="arithmetic_mean")
+    s.add_argument("--weighting", default="none")
+    s.add_argument("--taxonomy-map", help="acc,taxonomy CSV (one-to-one)")
+    s.add_argument("--key-col", default="acc")
+    s.add_argument("--value-col", default="count")
+    s.add_argument("--min-prevalence", type=float, default=0.05)
+    s.add_argument("--chunk-samples", type=int, default=2000)
+    s.add_argument("--k", type=int, default=10)
+    s.add_argument("--min-abundance", type=float, default=0.001)
+
+    s = add(
+        "kegg-completeness",
+        _cmd_kegg_completeness,
+        "KEGG module and pathway completeness per sample",
+    )
+    s.add_argument("--profiles", required=True)
+    s.add_argument("--annotations", required=True, help="KEGG,acc,count CSV")
+    s.add_argument("--taxonomy", required=True, help="GlobDB taxonomy TSV")
+    s.add_argument("--modules", required=True)
+    s.add_argument("--pathways", required=True)
+    s.add_argument("--out-modules", required=True)
+    s.add_argument("--out-pathways", required=True)
+    s.add_argument("--samples", help="CSV with an acc column")
+    s.add_argument("--chunk-samples", type=int, default=2000)
 
     s = add("partition", _cmd_partition, "group-aware train/test partitions")
     s.add_argument("--metadata", required=True)

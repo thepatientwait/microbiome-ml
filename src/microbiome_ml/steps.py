@@ -125,6 +125,148 @@ def aggregate_features(
     return out_path
 
 
+def _write_chunks(chunks, out: Path) -> int:
+    """Write an iterable of frames with identical columns as one CSV."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    n = 0
+    first = True
+    with tmp.open("wb") as handle:
+        for frame in chunks:
+            frame.write_csv(handle, include_header=first)
+            first = False
+            n += frame.height
+    if first:
+        tmp.write_text("acc\n")
+    tmp.replace(out)
+    return n
+
+
+def aggregate_annotation_features(
+    profiles: PathLike,
+    annotations: PathLike,
+    feature_col: str,
+    out: PathLike,
+    method: str = "arithmetic_mean",
+    weighting: str = "none",
+    taxonomy_map: Optional[PathLike] = None,
+    key_col: str = ID,
+    value_col: str = "count",
+    min_prevalence: float = 0.05,
+    chunk_samples: int = 2000,
+    k: int = 10,
+    min_abundance: float = 0.001,
+) -> Path:
+    """Aggregate a long genome annotation table (eggNOG, KEGG, ...) to samples.
+
+    ``annotations`` has one row per genome and feature (``key_col``,
+    ``feature_col``, ``value_col``). Features present in fewer than
+    ``min_prevalence`` of the genomes are dropped. The result equals
+    :func:`aggregate_features` on the pivoted table but is computed on the
+    sparse matrix, ``chunk_samples`` samples at a time (see
+    :mod:`microbiome_ml.wrangle.annotations`).
+    """
+    from microbiome_ml.wrangle.annotations import (
+        iter_aggregate_annotations,
+        scan_annotation_matrix,
+    )
+
+    ann = scan_annotation_matrix(
+        annotations,
+        feature_col,
+        key_col=key_col,
+        value_col=value_col,
+        taxonomy_map=taxonomy_map,
+        min_prevalence=min_prevalence,
+    )
+    rel = pl.scan_csv(str(profiles)).select("sample", "taxonomy", "relabund")
+    n = _write_chunks(
+        iter_aggregate_annotations(
+            ann,
+            rel,
+            method=method,
+            weighting=weighting,
+            k=k,
+            min_abundance=min_abundance,
+            chunk_samples=chunk_samples,
+        ),
+        Path(out),
+    )
+    logger.info("Wrote %d samples x %d %s features to %s", n, len(ann.features), feature_col, out)
+    return Path(out)
+
+
+def kegg_completeness_features(
+    profiles: PathLike,
+    annotations: PathLike,
+    taxonomy: PathLike,
+    mappings: Dict[str, PathLike],
+    outputs: Dict[str, PathLike],
+    samples: Optional[PathLike] = None,
+    keep_if_contains: Optional[Dict[str, str]] = None,
+    key_col: str = "KEGG",
+    chunk_samples: int = 2000,
+) -> Dict[str, Path]:
+    """KEGG module / pathway completeness per sample.
+
+    For each name in ``mappings`` (e.g. ``"module"``, ``"pathway"``) writes
+    the fraction of that module's (pathway's) orthologs present in at least
+    one genome of the sample (see
+    :func:`microbiome_ml.wrangle.annotations.iter_kegg_completeness`).
+
+    Args:
+        profiles: Species abundance table ``sample, taxonomy, relabund``.
+        annotations: Long ``KEGG, acc, count`` ortholog table.
+        taxonomy: GlobDB taxonomy TSV (no header): ``acc<TAB>taxonomy`` with
+            spaces in species names, as shipped.
+        mappings: name -> KEGG link file (``<id><TAB><ko>``).
+        outputs: name -> output CSV.
+        samples: Optional CSV whose ``acc`` column restricts the samples.
+        keep_if_contains: name -> text a feature id must contain (``"map"``
+            for reference pathways).
+    """
+    from microbiome_ml.wrangle.annotations import (
+        iter_kegg_completeness,
+        read_kegg_mapping,
+        scan_annotation_matrix,
+    )
+
+    tax = pl.read_csv(
+        str(taxonomy),
+        separator="\t",
+        has_header=False,
+        new_columns=["acc", "taxonomy"],
+    ).with_columns(pl.col("taxonomy").str.replace_all(" ", "_"))
+    ann = scan_annotation_matrix(
+        annotations,
+        "KEGG",
+        key_col="acc",
+        taxonomy_map=tax,
+        min_prevalence=0.0,
+    )
+    rel = pl.scan_csv(str(profiles)).select("sample", "taxonomy")
+    rel = rel.filter(pl.col("taxonomy").str.contains(";s__"))
+    keep = (
+        pl.read_csv(str(samples))["acc"].to_list() if samples is not None else None
+    )
+    written = {}
+    for name, mapping_path in mappings.items():
+        mapping = read_kegg_mapping(
+            mapping_path,
+            name,
+            keep_if_contains=(keep_if_contains or {}).get(name),
+        )
+        n = _write_chunks(
+            iter_kegg_completeness(
+                ann, mapping, rel, samples=keep, chunk_samples=chunk_samples
+            ),
+            Path(outputs[name]),
+        )
+        logger.info("Wrote %d samples x %s completeness to %s", n, name, outputs[name])
+        written[name] = Path(outputs[name])
+    return written
+
+
 def partition_samples(
     metadata: PathLike,
     label_columns: Sequence[str],
@@ -644,6 +786,8 @@ def logi_table(
 __all__ = [
     "rank_features",
     "aggregate_features",
+    "aggregate_annotation_features",
+    "kegg_completeness_features",
     "partition_samples",
     "select_features_table",
     "fit_table_model",
