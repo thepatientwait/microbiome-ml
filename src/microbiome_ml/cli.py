@@ -3,7 +3,7 @@
     python -m microbiome_ml.cli [--log-file LOG --attempt N] <command> ...
 
 Commands: ``rank-features``, ``aggregate``, ``partition``, ``select-features``,
-``fit`` and ``logo``. Each writes the files named on the command line, logs
+``fit``, ``logo`` and ``logi``. Each writes the files named on the command line, logs
 its progress and exits non-zero on error, so it drops straight into a
 workflow rule::
 
@@ -151,6 +151,29 @@ def _cmd_logo(a: argparse.Namespace) -> None:
         target_label=a.target_label,
         n_jobs=a.threads,
         id_column=a.id_column,
+        out_by_group=a.out_by_group,
+    )
+
+
+def _cmd_logi(a: argparse.Namespace) -> None:
+    from microbiome_ml import steps
+
+    steps.logi_table(
+        a.train,
+        a.metadata,
+        a.model,
+        a.params,
+        a.group_factor,
+        a.out_predictions,
+        a.out_metrics,
+        a.out_importances,
+        a.out_holdout_predictions,
+        a.out_holdout_metrics,
+        subgroup_column=a.subgroup,
+        feature_label=a.feature_label,
+        target_label=a.target_label,
+        n_jobs=a.threads,
+        id_column=a.id_column,
     )
 
 
@@ -255,6 +278,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out-predictions", required=True)
     s.add_argument("--out-metrics", required=True)
     s.add_argument("--out-importances", required=True)
+    s.add_argument("--out-by-group", help="optional per-group metrics CSV")
+    s.add_argument("--threads", type=int, default=1)
+    s.add_argument("--feature-label", default="")
+    s.add_argument("--target-label", default="")
+    s.add_argument("--id-column", default="acc")
+
+    s = add("logi", _cmd_logi, "leave-one-group-in with tuned parameters")
+    s.add_argument("--train", required=True)
+    s.add_argument("--metadata", required=True)
+    s.add_argument("--model", required=True)
+    s.add_argument("--params", required=True, help="best-params YAML from fit")
+    s.add_argument("--group-factor", required=True)
+    s.add_argument("--subgroup", default="bioproject")
+    s.add_argument("--out-predictions", required=True)
+    s.add_argument("--out-metrics", required=True)
+    s.add_argument("--out-importances", required=True)
+    s.add_argument("--out-holdout-predictions", required=True)
+    s.add_argument("--out-holdout-metrics", required=True)
     s.add_argument("--threads", type=int, default=1)
     s.add_argument("--feature-label", default="")
     s.add_argument("--target-label", default="")

@@ -60,6 +60,7 @@ layouts, and `python -m microbiome_ml.cli` exposes them:
 | `select-features` | prevalence filter + Boruta on the **train** rows | `<features>, target, acc` for train and test |
 | `fit` | K-fold grid search, out-of-fold and test predictions | pickle, best-params YAML, `acc,real,pred`, metrics |
 | `logo` | leave-one-group-out with the tuned parameters | `acc,group,real,pred`, metrics, importances |
+| `logi` | leave-one-group-in: cross-validation inside each group plus a holdout of that group | the same, per group, plus holdout predictions/metrics |
 
 ```bash
 python -m microbiome_ml.cli --log-file logs/fit.log --attempt 1 \
@@ -998,6 +999,29 @@ res.save("out/logo", prefix="ph~tax_genus")
 ```
 
 `leave_one_group_out` and `out_of_fold_predictions` also take plain arrays.
+
+**Leave-one-group-in (LOGI)** is the complement: how much signal is there
+*inside* each group? For every group (say an ecoregion) the model is
+cross-validated on that group's training rows alone and scored on a holdout of
+the same group:
+
+```python
+from microbiome_ml.train.validation import leave_one_group_in
+
+res = leave_one_group_in(
+    estimator, X, y,
+    groups=ecoregion, subgroups=bioproject, samples=ids, feature_names=names,
+)
+res.metrics            # per group: n_samples, mae, mse, rmse, r2, q2, pcc, pval, comment
+res.holdout_metrics    # the same on the group's holdout rows; comment = split method
+res.holdout_predictions, res.predictions, res.importances
+```
+
+The holdout keeps whole `subgroups` together (bioprojects) when the group has
+at least 5 of them and the split reaches `test_size`; otherwise it is split
+stratified by label bin, and at random if some bin is too small. A group with
+fewer than 25 labelled samples is skipped (reason in `comment`), as is one with
+fewer than 20 training rows or a constant label.
 
 ### Picking the best: per label, per scheme
 

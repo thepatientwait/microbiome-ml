@@ -15,7 +15,17 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import polars as pl
@@ -25,6 +35,7 @@ from sklearn.model_selection import (
     LeaveOneGroupOut,
     PredefinedSplit,
     cross_val_predict,
+    train_test_split,
 )
 
 from microbiome_ml.train import model_zoo as zoo
@@ -273,3 +284,340 @@ def logo_for_dataset(
         }
     )
     return result
+
+
+# --------------------------------------------------------------------------
+# leave-one-group-in
+# --------------------------------------------------------------------------
+HoldoutFn = Callable[..., Tuple[np.ndarray, np.ndarray, str, float]]
+
+
+def group_holdout_split(
+    y: Sequence[float],
+    subgroups: Sequence[Any],
+    test_size: float = 0.2,
+    seed: int = 42,
+    min_labelled: int = 25,
+    min_subgroups: int = 5,
+    n_bins: int = 5,
+    subgroup_name: str = "bioproject",
+    samples: Optional[Sequence[str]] = None,
+) -> Tuple[np.ndarray, np.ndarray, str, float]:
+    """Split one group's samples into train and holdout rows.
+
+    ``samples`` (ids, same order as ``y``) is accepted for symmetry with
+    custom split functions and is not used here.
+
+    Whole sub-groups (e.g. bioprojects inside an ecoregion) are held out
+    together when there are at least ``min_subgroups`` of them and the split
+    reaches ``test_size`` within a tolerance of ``max(0.05, 1 / n)``;
+    otherwise the samples are split stratified by label bin, and at random if
+    some bin is too small to stratify.
+
+    Returns:
+        ``(train_idx, test_idx, method, achieved_fraction)`` where the indices
+        are positions in ``y``. ``method`` records which route was taken.
+
+    Raises:
+        ValueError: with fewer than ``min_labelled`` samples.
+    """
+    from microbiome_ml.wrangle.splits import SplitManager
+
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < min_labelled:
+        raise ValueError(
+            f"only {n} labelled samples; need at least {min_labelled}"
+        )
+    sub = np.array([str(g) for g in subgroups])
+    n_sub = len(np.unique(sub))
+    tolerance = max(0.05, 1.0 / n)
+    method = f"{subgroup_name}_grouped"
+    frac = 0.0
+    constant = bool(y.min() == y.max())
+    use_grouped = n_sub >= min_subgroups and not constant
+    train_idx = test_idx = np.zeros(0, dtype=int)
+    if use_grouped:
+        frame = pl.DataFrame(
+            {"sample": [str(i) for i in range(n)], "y": y, "g": sub}
+        )
+        sm = SplitManager("y")
+        sm.create_holdout(
+            frame,
+            grouping="g",
+            test_size=test_size,
+            n_bins=n_bins,
+            random_state=seed,
+        )
+        assert sm.holdout is not None
+        side = dict(
+            zip(sm.holdout["sample"].to_list(), sm.holdout["split"].to_list())
+        )
+        is_test = np.array([side[str(i)] == "test" for i in range(n)])
+        train_idx, test_idx = np.where(~is_test)[0], np.where(is_test)[0]
+        frac = len(test_idx) / n
+        use_grouped = abs(frac - test_size) <= tolerance
+        if not use_grouped:
+            method = "sample_stratified_fallback: grouped fraction out of range"
+    elif constant:
+        method = "sample_stratified_fallback: constant label"
+    else:
+        method = f"sample_stratified_fallback: only {n_sub} {subgroup_name}s"
+
+    if not use_grouped:
+        strata = None
+        if y.min() != y.max():
+            edges = np.linspace(y.min(), y.max(), n_bins + 1)
+            strata = np.digitize(y, edges[1:-1], right=False)
+        positions = np.arange(n)
+        try:
+            train_idx, test_idx = train_test_split(
+                positions,
+                test_size=test_size,
+                random_state=seed,
+                stratify=strata,
+            )
+        except ValueError:
+            method = "sample_random_fallback: insufficient target-bin counts"
+            train_idx, test_idx = train_test_split(
+                positions, test_size=test_size, random_state=seed
+            )
+        frac = len(test_idx) / n
+    return np.asarray(train_idx), np.asarray(test_idx), method, frac
+
+
+@dataclass
+class LogiResult:
+    """Outcome of :func:`leave_one_group_in`.
+
+    Attributes:
+        metrics: One row per group: ``group, n_samples, mae, mse, rmse, r2,
+            q2, pcc, pval, comment``. ``n_samples`` is the number of training
+            rows of the group; metrics are null (and ``comment`` says why) for
+            a group that was skipped.
+        predictions: ``sample, group, real, pred`` out-of-fold predictions
+            inside each group's training rows.
+        importances: ``group, feature, importance`` from a model fitted on the
+            group's training rows.
+        holdout_metrics: One row per group with the same columns, scored on
+            the group's holdout rows (``comment`` = split method + fraction).
+        holdout_predictions: ``sample, group, real, pred, split_method``.
+    """
+
+    metrics: pl.DataFrame
+    predictions: pl.DataFrame
+    importances: pl.DataFrame
+    holdout_metrics: pl.DataFrame
+    holdout_predictions: pl.DataFrame
+    n_groups: int = 0
+
+
+_METRIC_COLS = ["mae", "mse", "rmse", "r2", "q2", "pcc", "pval"]
+
+
+def _metric_row(
+    group: str,
+    n: int,
+    metrics: Optional[Dict[str, Optional[float]]],
+    comment: str,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {"group": group, "n_samples": n}
+    for c in _METRIC_COLS:
+        row[c] = None if metrics is None else metrics.get(c)
+    row["comment"] = comment
+    return row
+
+
+def leave_one_group_in(
+    estimator: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: Sequence[Any],
+    subgroups: Sequence[Any],
+    samples: Optional[Sequence[str]] = None,
+    feature_names: Optional[List[str]] = None,
+    cv_folds: int = 10,
+    min_train: int = 20,
+    test_size: float = 0.2,
+    min_labelled: int = 25,
+    min_subgroups: int = 5,
+    n_bins: int = 5,
+    seed: int = 42,
+    shuffle: bool = True,
+    n_jobs: Optional[int] = None,
+    alternative: str = "two-sided",
+    subgroup_name: str = "bioproject",
+    holdout_fn: Optional[HoldoutFn] = None,
+) -> LogiResult:
+    """Leave-one-group-in: how much signal is there *within* each group?
+
+    The complement of LOGO. For every group (e.g. an ecoregion) the model is
+    cross-validated on that group's samples alone, and scored on a holdout of
+    the same group that it never saw:
+
+    1. the group's samples are split into training and holdout rows
+       (:func:`group_holdout_split`: whole ``subgroups`` such as bioprojects
+       when there are enough of them);
+    2. out-of-fold predictions inside the training rows (``cv_folds`` folds);
+    3. a model fitted on the training rows gives the importances and the
+       holdout predictions.
+
+    A group is skipped (metrics null, reason in ``comment``) if it has fewer
+    than ``min_labelled`` samples ("skipped: ..."), fewer than ``min_train``
+    training rows ("Not enough samples") or a constant label ("Only one y
+    value"). Rows with a null group or subgroup are ignored.
+
+    Args:
+        estimator: Unfitted estimator (cloned per use).
+        X, y: Features and target of all samples.
+        groups: Group per sample (what is left in).
+        subgroups: Sub-group per sample used to hold out whole sub-groups.
+        shuffle: Shuffle the inner CV folds (seeded); ``False`` uses
+            consecutive folds like scikit-learn's integer ``cv``.
+        holdout_fn: Replacement for :func:`group_holdout_split`, called as
+            ``holdout_fn(y, subgroups, test_size=, seed=, min_labelled=,
+            min_subgroups=, n_bins=, subgroup_name=, samples=)`` for one
+            group and returning ``(train_idx, test_idx, method, fraction)``
+            (indices into ``y``); raise ``ValueError`` to skip the group.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y, dtype=float)
+    ids = (
+        [str(i) for i in range(len(y))]
+        if samples is None
+        else [str(s) for s in samples]
+    )
+    names = feature_names or [f"f{i}" for i in range(X.shape[1])]
+    grp = [None if g is None else str(g) for g in groups]
+    sub = [None if g is None else str(g) for g in subgroups]
+    split_fn = holdout_fn or group_holdout_split
+
+    metric_rows: List[Dict[str, Any]] = []
+    hold_rows: List[Dict[str, Any]] = []
+    pred_frames: List[pl.DataFrame] = []
+    imp_frames: List[pl.DataFrame] = []
+    hold_pred_frames: List[pl.DataFrame] = []
+    pred_schema = {
+        "sample": pl.Utf8,
+        "group": pl.Utf8,
+        "real": pl.Float64,
+        "pred": pl.Float64,
+    }
+
+    order = sorted({g for g in grp if g is not None})
+    for g in order:
+        rows = np.array(
+            [
+                i
+                for i in range(len(y))
+                if grp[i] == g and sub[i] is not None and not np.isnan(y[i])
+            ],
+            dtype=int,
+        )
+        try:
+            tr, te, method, frac = split_fn(
+                y[rows],
+                [sub[i] for i in rows],
+                test_size=test_size,
+                seed=seed,
+                min_labelled=min_labelled,
+                min_subgroups=min_subgroups,
+                n_bins=n_bins,
+                subgroup_name=subgroup_name,
+                samples=[ids[i] for i in rows],
+            )
+        except ValueError as exc:
+            logger.warning("Could not create a holdout for %s: %s", g, exc)
+            tr = te = np.zeros(0, dtype=int)
+            method, frac = f"skipped: {exc}", 0.0
+        train_rows, hold_rows_idx = rows[np.asarray(tr, int)], rows[np.asarray(te, int)]
+        Xt, yt = X[train_rows], y[train_rows]
+
+        pred = None
+        fitted = None
+        comment = ""
+        if len(train_rows) < min_train:
+            comment = "Not enough samples"
+        elif len(np.unique(yt)) == 1:
+            comment = "Only one y value"
+        else:
+            k = min(cv_folds, len(yt))
+            splitter = KFold(
+                k, shuffle=shuffle, random_state=seed if shuffle else None
+            )
+            pred = cross_val_predict(
+                clone(estimator), Xt, yt, cv=splitter, n_jobs=n_jobs
+            )
+            fitted = clone(estimator).fit(Xt, yt)
+            try:
+                imp = zoo.feature_importance(fitted)
+                imp_frames.append(
+                    pl.DataFrame(
+                        {"group": g, "feature": names, "importance": imp}
+                    ).sort("importance", descending=True)
+                )
+            except ValueError:
+                pass
+        m = None if pred is None else regression_metrics(yt, pred, alternative)
+        metric_rows.append(_metric_row(g, int(len(yt)), m, comment))
+        pred_frames.append(
+            pl.DataFrame(
+                {
+                    "sample": [ids[i] for i in train_rows],
+                    "group": [g] * len(train_rows),
+                    "real": yt,
+                    "pred": [None] * len(yt) if pred is None else pred,
+                },
+                schema=pred_schema,
+            )
+        )
+
+        h_comment = method
+        hm = None
+        hn = 0
+        h_pred = None
+        if len(hold_rows_idx) and fitted is not None:
+            Xh, yh = X[hold_rows_idx], y[hold_rows_idx]
+            h_pred = fitted.predict(Xh)
+            hm = regression_metrics(yh, h_pred, alternative)
+            hn = len(yh)
+            h_comment = f"{method}; fraction={frac:.3f}"
+            hold_pred_frames.append(
+                pl.DataFrame(
+                    {
+                        "sample": [ids[i] for i in hold_rows_idx],
+                        "group": [g] * hn,
+                        "real": yh,
+                        "pred": h_pred,
+                        "split_method": [method] * hn,
+                    },
+                    schema={**pred_schema, "split_method": pl.Utf8},
+                )
+            )
+        hold_rows.append(_metric_row(g, hn, hm, h_comment))
+
+    metric_schema = {
+        "group": pl.Utf8,
+        "n_samples": pl.Int64,
+        **{c: pl.Float64 for c in _METRIC_COLS},
+        "comment": pl.Utf8,
+    }
+    empty_pred = pl.DataFrame(schema=pred_schema)
+    return LogiResult(
+        metrics=pl.DataFrame(metric_rows, schema=metric_schema),
+        predictions=pl.concat(pred_frames) if pred_frames else empty_pred,
+        importances=pl.concat(imp_frames)
+        if imp_frames
+        else pl.DataFrame(
+            schema={
+                "group": pl.Utf8,
+                "feature": pl.Utf8,
+                "importance": pl.Float64,
+            }
+        ),
+        holdout_metrics=pl.DataFrame(hold_rows, schema=metric_schema),
+        holdout_predictions=pl.concat(hold_pred_frames)
+        if hold_pred_frames
+        else pl.DataFrame(schema={**pred_schema, "split_method": pl.Utf8}),
+        n_groups=len(order),
+    )

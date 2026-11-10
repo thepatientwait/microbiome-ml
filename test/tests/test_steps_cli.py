@@ -178,6 +178,7 @@ def test_select_fit_logo_pipeline_schemas(model_files):
             "--out-predictions", str(d / "logo_pred.csv"),
             "--out-metrics", str(d / "logo_metrics.csv"),
             "--out-importances", str(d / "logo_imp.csv"),
+            "--out-by-group", str(d / "logo_by_group.csv"),
             "--feature-label", "tax/genus", "--target-label", "y",
         ]
     )
@@ -190,7 +191,7 @@ def test_select_fit_logo_pipeline_schemas(model_files):
     li = pl.read_csv(d / "logo_imp.csv")
     assert li.columns == ["model", "feature", "target", "factor", "importance"]
     assert li["importance"].sum() == pytest.approx(1.0)
-    assert (d / "logo_metrics_by_group.csv").exists()
+    assert pl.read_csv(d / "logo_by_group.csv").height == lp["group"].n_unique()
 
 
 def test_cli_log_file_and_failure_exit_code(model_files):
@@ -234,3 +235,31 @@ def test_module_entry_point_runs_as_a_subprocess(tmp_path):
     assert "rank-features" in out.stdout and "select-features" in out.stdout
     bad = subprocess.run([sys.executable, "-m", "microbiome_ml.cli", "fit"], capture_output=True, text=True)
     assert bad.returncode != 0
+
+
+def test_logi_command_schemas(model_files):
+    d = model_files
+    # metadata with a coarser grouping (ecoregion) containing several bioprojects
+    meta = pl.read_csv(d / "meta_full.csv").with_columns(
+        (pl.col("bioproject").str.extract(r"(\d+)").cast(pl.Int64) // 6).cast(pl.Utf8).alias("eco")
+    )
+    meta.write_csv(d / "meta_eco.csv")
+    main(["select-features", "--features", str(d / "features.csv"), "--metadata", str(d / "meta_full.csv"), "--label", "label~y", "--partition", "label~y_partition", "--method", "none", "--out-train", str(d / "train.csv"), "--out-test", str(d / "test.csv")])
+    (d / "best.yaml").write_text(yaml.safe_dump({"model__alpha": 1.0}))
+    rc = main(
+        [
+            "logi", "--train", str(d / "train.csv"), "--metadata", str(d / "meta_eco.csv"),
+            "--model", "ridge", "--params", str(d / "best.yaml"), "--group-factor", "eco",
+            "--out-predictions", str(d / "p.csv"), "--out-metrics", str(d / "m.csv"),
+            "--out-importances", str(d / "i.csv"), "--out-holdout-predictions", str(d / "hp.csv"),
+            "--out-holdout-metrics", str(d / "hm.csv"), "--feature-label", "tax/genus", "--target-label", "y",
+        ]
+    )
+    assert rc == 0
+    cols = ["feature", "target", "model", "factor", "group", "mse", "r2", "q2", "pcc", "pval", "n_samples", "comment"]
+    m, hm = pl.read_csv(d / "m.csv"), pl.read_csv(d / "hm.csv")
+    assert m.columns == cols and hm.columns == cols
+    assert pl.read_csv(d / "p.csv").columns == ["acc", "group", "real", "pred"]
+    assert pl.read_csv(d / "hp.csv").columns == ["acc", "group", "real", "pred", "split_method"]
+    assert pl.read_csv(d / "i.csv").columns == ["model", "feature", "target", "factor", "group", "importance"]
+    assert m["factor"][0] == "eco" and set(m["group"].cast(pl.Utf8)) == set(meta["eco"].unique())

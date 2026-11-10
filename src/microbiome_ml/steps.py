@@ -449,6 +449,7 @@ def logo_table(
     target_label: str = "",
     n_jobs: int = 1,
     id_column: str = ID,
+    out_by_group: Optional[PathLike] = None,
 ) -> Optional[Dict[str, Any]]:
     """Leave-one-group-out on a training table, with tuned hyperparameters.
 
@@ -511,11 +512,133 @@ def logo_table(
     ).select("model", "feature", "target", "factor", "importance").write_csv(
         str(out_importances)
     )
-    by_group = Path(str(out_metrics)).with_name(
-        Path(str(out_metrics)).stem + "_by_group.csv"
-    )
-    res.by_group.write_csv(str(by_group))
+    if out_by_group is not None:
+        Path(out_by_group).parent.mkdir(parents=True, exist_ok=True)
+        res.by_group.write_csv(str(out_by_group))
     return {"n_groups": res.n_groups, **res.metrics}
+
+
+def logi_table(
+    train: PathLike,
+    metadata: PathLike,
+    model: str,
+    params: PathLike,
+    group_factor: str,
+    out_predictions: PathLike,
+    out_metrics: PathLike,
+    out_importances: PathLike,
+    out_holdout_predictions: PathLike,
+    out_holdout_metrics: PathLike,
+    subgroup_column: str = "bioproject",
+    feature_label: str = "",
+    target_label: str = "",
+    n_jobs: int = 1,
+    id_column: str = ID,
+    shuffle: bool = False,
+    seed: int = 42,
+    holdout_fn: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Leave-one-group-in on a training table, with tuned hyperparameters.
+
+    For every ``group_factor`` group the model is cross-validated on the
+    group's own training rows and scored on a holdout of the same group (whole
+    ``subgroup_column`` values when there are enough, see
+    :func:`microbiome_ml.train.validation.group_holdout_split`). The split of
+    a group is decided from the training rows only.
+
+    Files: ``acc,group,real,pred`` out-of-fold predictions; a metrics table
+    (``feature,target,model,factor,group,mse,r2,q2,pcc,pval,n_samples,
+    comment``); importances (``model,feature,target,factor,group,
+    importance``); and the same predictions/metrics for the holdout rows
+    (predictions with a ``split_method`` column). A skipped group has null
+    metrics and its reason in ``comment``.
+    """
+    from microbiome_ml.train.validation import leave_one_group_in
+
+    model = zoo.resolve(model)
+    df = pl.read_csv(str(train)).unique(id_column, keep="first")
+    meta = pl.read_csv(str(metadata), infer_schema_length=10000).select(
+        pl.col(id_column),
+        pl.col(group_factor).cast(pl.Utf8),
+        pl.col(subgroup_column).cast(pl.Utf8).alias("_subgroup")
+        if subgroup_column != group_factor
+        else pl.col(group_factor).cast(pl.Utf8).alias("_subgroup"),
+    )
+    df = df.join(meta, on=id_column, how="inner").drop_nulls(group_factor)
+    if df[group_factor].n_unique() < 2:
+        logger.error("Only one group in %s; nothing to do", group_factor)
+        return None
+    with open(params) as fh:
+        hyper = yaml.safe_load(fh) or {}
+    estimator = zoo.build(model, **hyper)
+    features = [
+        c
+        for c in df.columns
+        if c not in (id_column, TARGET, group_factor, "_subgroup")
+    ]
+    res = leave_one_group_in(
+        estimator,
+        df.select(features).to_numpy(),
+        df[TARGET].to_numpy(),
+        df[group_factor].to_list(),
+        df["_subgroup"].to_list(),
+        samples=df[id_column].to_list(),
+        feature_names=features,
+        shuffle=shuffle,
+        seed=seed,
+        n_jobs=n_jobs,
+        alternative="greater",
+        subgroup_name=subgroup_column,
+        holdout_fn=holdout_fn,
+    )
+
+    def table(frame: pl.DataFrame) -> pl.DataFrame:
+        return frame.select(
+            pl.lit(feature_label).alias("feature"),
+            pl.lit(target_label).alias("target"),
+            pl.lit(model).alias("model"),
+            pl.lit(group_factor).alias("factor"),
+            "group",
+            "mse",
+            "r2",
+            "q2",
+            "pcc",
+            "pval",
+            pl.col("n_samples").cast(pl.Int32),
+            "comment",
+        )
+
+    for path in (
+        out_predictions,
+        out_metrics,
+        out_importances,
+        out_holdout_predictions,
+        out_holdout_metrics,
+    ):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    res.predictions.rename({"sample": "acc"}).write_csv(str(out_predictions))
+    table(res.metrics).write_csv(str(out_metrics))
+    res.importances.select(
+        pl.lit(model).alias("model"),
+        "feature",
+        pl.lit(target_label).alias("target"),
+        pl.lit(group_factor).alias("factor"),
+        "group",
+        "importance",
+    ).write_csv(str(out_importances))
+    res.holdout_predictions.rename({"sample": "acc"}).write_csv(
+        str(out_holdout_predictions)
+    )
+    table(res.holdout_metrics).write_csv(str(out_holdout_metrics))
+    fitted = res.metrics.filter(pl.col("r2").is_not_null()).height
+    logger.info(
+        "LOGI over %d %s groups: %d fitted, %d with a holdout score",
+        res.n_groups,
+        group_factor,
+        fitted,
+        res.holdout_metrics.filter(pl.col("r2").is_not_null()).height,
+    )
+    return {"n_groups": res.n_groups, "n_fitted": fitted}
 
 
 __all__ = [
@@ -525,4 +648,5 @@ __all__ = [
     "select_features_table",
     "fit_table_model",
     "logo_table",
+    "logi_table",
 ]

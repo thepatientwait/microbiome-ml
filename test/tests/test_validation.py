@@ -290,3 +290,130 @@ def test_logo_for_dataset_and_save(tmp_path):
     rec = json.loads((out / "y~fs_metrics.json").read_text())
     assert rec["grouping"] == "bioproject" and rec["r2"] > 0.9
     assert pl.read_csv(out / "y~fs_predictions.csv").height == len(res.predictions)
+
+
+# ---------------------------------------------------------------- LOGI
+from microbiome_ml.train.validation import (  # noqa: E402
+    group_holdout_split,
+    leave_one_group_in,
+)
+
+
+def _logi_data(seed=0):
+    """Groups of different kinds, each with bioproject sub-groups."""
+    rng = np.random.default_rng(seed)
+    rows = []  # group, bioproject, n
+    spec = [
+        ("big", 12, 10),     # 120 samples, 12 bioprojects -> grouped holdout
+        ("few_bp", 3, 20),   # 60 samples, 3 bioprojects -> stratified fallback
+        ("tiny", 2, 6),      # 12 samples -> skipped (< 25 labelled)
+        ("const", 6, 6),     # 36 samples, constant label
+    ]
+    X, y, grp, sub, ids = [], [], [], [], []
+    for g, nbp, per in spec:
+        # evenly spread labels (shuffled) so every label bin is populated
+        us = rng.permutation(np.linspace(0, 10, nbp * per))
+        for b in range(nbp):
+            for i in range(per):
+                u = float(us[b * per + i])
+                x = np.array([u / 5 - 1, rng.normal(), rng.normal(), rng.normal()]) + 0 * u
+                X.append(x)
+                # a uniform label (even bin counts) so stratified splitting is possible
+                y.append(5.0 if g == "const" else u + rng.normal(0, 0.05))
+                grp.append(g)
+                sub.append(f"{g}_bp{b}")
+                ids.append(f"{g}_{b}_{i}")
+    return np.array(X), np.array(y), grp, sub, ids
+
+
+def test_group_holdout_split_grouped_route():
+    rng = np.random.default_rng(0)
+    y = rng.normal(size=100)
+    sub = [f"bp{i // 10}" for i in range(100)]
+    tr, te, method, frac = group_holdout_split(y, sub)
+    assert method == "bioproject_grouped"
+    assert set(np.array(sub)[tr]).isdisjoint(set(np.array(sub)[te]))
+    assert len(tr) + len(te) == 100 and frac == pytest.approx(len(te) / 100)
+    assert abs(frac - 0.2) <= 0.1
+
+
+def test_group_holdout_split_fallbacks_and_errors():
+    rng = np.random.default_rng(0)
+    y = rng.uniform(size=60)  # even bin counts, so stratification is possible
+    # too few bioprojects -> stratified samples
+    tr, te, method, frac = group_holdout_split(y, [f"bp{i % 3}" for i in range(60)])
+    assert method == "sample_stratified_fallback: only 3 bioprojects"
+    assert len(te) == 12 and frac == pytest.approx(0.2)
+    # constant label cannot be stratified -> plain random split (no error)
+    tr, te, method, frac = group_holdout_split(np.ones(60), [f"bp{i % 3}" for i in range(60)])
+    assert method.startswith("sample_stratified_fallback") and len(te) == 12
+    # a bin with one sample cannot be stratified -> random fallback
+    y2 = np.concatenate([np.zeros(58), [10.0, 5.0]])
+    tr, te, method, frac = group_holdout_split(y2, [f"bp{i % 3}" for i in range(60)])
+    assert method == "sample_random_fallback: insufficient target-bin counts"
+    # normally distributed labels leave single-sample tail bins -> random split
+    yn = rng.normal(size=60)
+    assert group_holdout_split(yn, [f"bp{i % 3}" for i in range(60)], n_bins=10)[2].startswith("sample_random_fallback")
+    with pytest.raises(ValueError, match="only 10 labelled samples"):
+        group_holdout_split(y[:10], ["a"] * 10)
+
+
+def test_logi_handles_each_kind_of_group():
+    X, y, grp, sub, ids = _logi_data()
+    res = leave_one_group_in(
+        zoo.build("ridge"), X, y, grp, sub, samples=ids,
+        feature_names=["a", "b", "c", "d"], alternative="greater",
+    )
+    m = {r["group"]: r for r in res.metrics.iter_rows(named=True)}
+    h = {r["group"]: r for r in res.holdout_metrics.iter_rows(named=True)}
+    assert res.n_groups == 4
+    # big: grouped holdout, good fit inside and on the holdout
+    assert m["big"]["comment"] == "" and m["big"]["r2"] is not None
+    assert h["big"]["comment"].startswith("bioproject_grouped; fraction=")
+    assert h["big"]["n_samples"] > 0 and h["big"]["r2"] is not None
+    # few bioprojects: stratified fallback is recorded
+    assert "only 3 bioprojects" in h["few_bp"]["comment"]
+    # tiny: skipped before anything is fitted
+    assert h["tiny"]["comment"].startswith("skipped: only 12 labelled samples")
+    assert m["tiny"]["r2"] is None and m["tiny"]["n_samples"] == 0
+    # constant label: holdout exists but nothing is fitted
+    assert m["const"]["comment"] == "Only one y value"
+    assert h["const"]["r2"] is None and h["const"]["n_samples"] == 0
+    # predictions: training rows only, null for the constant group
+    preds = res.predictions
+    assert preds.columns == ["sample", "group", "real", "pred"]
+    assert preds.filter(pl.col("group") == "const")["pred"].null_count() == preds.filter(pl.col("group") == "const").height
+    assert preds.filter(pl.col("group") == "big")["pred"].null_count() == 0
+    hold = res.holdout_predictions
+    assert set(hold["group"].unique()) == {"big", "few_bp"}
+    assert set(hold["sample"]).isdisjoint(set(preds["sample"]))
+    # importances per fitted group, normalised
+    imp = res.importances
+    assert set(imp["group"].unique()) == {"big", "few_bp"}
+    for g in ("big", "few_bp"):
+        assert imp.filter(pl.col("group") == g)["importance"].sum() == pytest.approx(1.0)
+
+
+def test_logi_is_reproducible_and_ignores_null_groups():
+    X, y, grp, sub, ids = _logi_data()
+    grp2 = [None if i % 50 == 0 else g for i, g in enumerate(grp)]
+    a = leave_one_group_in(zoo.build("ridge"), X, y, grp2, sub, samples=ids)
+    b = leave_one_group_in(zoo.build("ridge"), X, y, grp2, sub, samples=ids)
+    assert a.metrics.equals(b.metrics) and a.predictions.equals(b.predictions)
+    assert a.n_groups == 4
+    null_ids = {ids[i] for i in range(len(ids)) if grp2[i] is None}
+    assert null_ids.isdisjoint(set(a.predictions["sample"]) | set(a.holdout_predictions["sample"]))
+
+
+def test_logi_custom_holdout_function_is_used():
+    X, y, grp, sub, ids = _logi_data()
+    calls = []
+
+    def fn(yy, ss, **kw):
+        calls.append(len(yy))
+        n = len(yy)
+        return np.arange(0, n - 5), np.arange(n - 5, n), "custom", 5 / n
+
+    res = leave_one_group_in(zoo.build("ridge"), X, y, grp, sub, samples=ids, holdout_fn=fn)
+    assert len(calls) == 4
+    assert all(c.startswith("custom") for c in res.holdout_metrics["comment"] if c)
