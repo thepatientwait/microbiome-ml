@@ -783,6 +783,191 @@ def logi_table(
     return {"n_groups": res.n_groups, "n_fitted": fitted}
 
 
+# --------------------------------------------------------------------------
+# figures
+# --------------------------------------------------------------------------
+def plot_predictions(
+    predictions: PathLike,
+    out: PathLike,
+    title: str,
+    units: str = "",
+    density_cmap: str = "inferno_r",
+    validation: Optional[PathLike] = None,
+    style: Optional[PathLike] = None,
+    left_label: str = "CV",
+    right_label: str = "Validation",
+    dpi: int = 500,
+) -> Path:
+    """Actual vs predicted density from an ``acc,real,pred`` table.
+
+    With ``validation`` (another ``acc,real,pred`` table, e.g. the held-out
+    test predictions) the two are drawn side by side.
+    """
+    from microbiome_ml.visualise import diagnostics as dg
+
+    cv = pl.read_csv(str(predictions)).drop_nulls()
+    pred, real = cv["pred"].to_numpy(), cv["real"].to_numpy()
+    if validation is None:
+        dg.plot_prediction_density(
+            pred, real, title=title, units=units, density_cmap=density_cmap,
+            file_name=out, style=style, dpi=dpi,
+        )
+    else:
+        val = pl.read_csv(str(validation)).drop_nulls()
+        dg.plot_two_panels(
+            (pred, real), (val["pred"].to_numpy(), val["real"].to_numpy()),
+            title=title, units=units, density_cmap=density_cmap,
+            left_label=left_label, right_label=right_label,
+            file_name=out, style=style, dpi=dpi,
+        )
+    return Path(out)
+
+
+def plot_logo_predictions(
+    predictions: PathLike,
+    out: PathLike,
+    title: str,
+    units: str = "",
+    group_label: Optional[str] = None,
+    hist_cmap: str = "viridis",
+    density_cmap: str = "inferno_r",
+    style: Optional[PathLike] = None,
+    dpi: int = 500,
+) -> Path:
+    """LOGO predictions (``acc,group,real,pred``): density plus the error
+    histogram coloured by the held-out group."""
+    from microbiome_ml.visualise import diagnostics as dg
+
+    df = pl.read_csv(str(predictions)).drop_nulls(subset=["group", "real", "pred"])
+    if "group" not in df.columns:
+        raise ValueError(f"Expected a 'group' column in {predictions}")
+    dg.plot_predictions_by_group(
+        df["pred"].to_numpy(), df["real"].to_numpy(), df["group"].cast(pl.Utf8),
+        title=title, units=units, hist_cmap=hist_cmap, density_cmap=density_cmap,
+        cbar_label=group_label, file_name=out, style=style, dpi=dpi,
+    )
+    return Path(out)
+
+
+def plot_logi_predictions(
+    cv_predictions: PathLike,
+    holdout_predictions: PathLike,
+    out_dir: PathLike,
+    title: str,
+    units: str = "",
+    density_cmap: str = "inferno_r",
+    style: Optional[PathLike] = None,
+    dpi: int = 500,
+) -> List[Path]:
+    """One CV-vs-holdout figure per group from the LOGI prediction tables.
+    ``title`` may contain ``{group}``."""
+    from microbiome_ml.visualise import diagnostics as dg
+
+    return dg.plot_logi_groups(
+        pl.read_csv(str(cv_predictions)),
+        pl.read_csv(str(holdout_predictions)),
+        out_dir, title, units, density_cmap, style=style, dpi=dpi,
+    )
+
+
+def plot_pca(
+    train: PathLike,
+    test: PathLike,
+    metadata: PathLike,
+    group_factors: Sequence[str],
+    out: PathLike,
+    title: str,
+    target_name: str = "label",
+    n_components: int = 2,
+    scale: bool = True,
+    top_n: int = 10,
+    legend_max_levels: int = 12,
+    other_colour: str = "lightgrey",
+    clip_percentile: Optional[float] = 0.5,
+    style: Optional[PathLike] = None,
+    id_column: str = ID,
+    dpi: int = 300,
+) -> Path:
+    """PCA of the selected features (scaler and PCA fitted on the training
+    rows, test rows projected) coloured by each group factor and by the label.
+
+    ``train`` / ``test`` are the ``<features>, target, acc`` tables;
+    ``metadata`` supplies the group factors. ``title`` gets
+    ``\n(<n> features, <n> train / <n> test samples)`` appended.
+    """
+    from microbiome_ml.visualise import diagnostics as dg
+
+    tr = pl.read_csv(str(train)).with_columns(pl.lit("train").alias("split"))
+    te = pl.read_csv(str(test)).with_columns(pl.lit("test").alias("split"))
+    features = [c for c in tr.columns if c not in (TARGET, id_column, "split")]
+    data = pl.concat([tr, te.select(tr.columns)], how="vertical_relaxed")
+    meta = pl.read_csv(str(metadata), infer_schema_length=10000).select(
+        [id_column] + [pl.col(g).cast(pl.Utf8) for g in group_factors]
+    )
+    data = data.join(meta, on=id_column, how="left")
+    X = (
+        data.select(features).fill_null(0.0).fill_nan(0.0).to_numpy().astype(np.float64)
+    )
+    is_train = (data["split"] == "train").to_numpy()
+    coords, evr = dg.pca_embedding(X, is_train, n_components, scale)
+    logger.info("Explained variance: %s", np.round(evr * 100, 2))
+    dg.plot_pca_overview(
+        coords, evr, is_train,
+        {g: data[g].to_list() for g in group_factors},
+        data[TARGET].to_numpy().astype(float), target_name,
+        title=(
+            f"{title}\n({len(features)} features, {int(is_train.sum())} train / "
+            f"{int((~is_train).sum())} test samples)"
+        ),
+        top_n=top_n, legend_max_levels=legend_max_levels, other_colour=other_colour,
+        clip_percentile=clip_percentile, file_name=out, style=style, dpi=dpi,
+    )
+    return Path(out)
+
+
+def plot_feature_importances(
+    model: PathLike,
+    train: PathLike,
+    out_image: PathLike,
+    out_table: PathLike,
+    model_name: str = "",
+    target: str = "",
+    feature_set: str = "",
+    shorten_taxa: bool = False,
+    top: int = 10,
+    style: Optional[PathLike] = None,
+    id_column: str = ID,
+) -> pl.DataFrame:
+    """Importances of a pickled model on the columns of a training table.
+
+    Writes the full table (``feature, importance, model, target,
+    feature_set``, largest first) and a bar chart of the top ``top``;
+    ``shorten_taxa`` reduces lineage-named features to their last rank.
+    """
+    from microbiome_ml.visualise import diagnostics as dg
+
+    features = pl.read_csv(str(train), n_rows=0).drop([TARGET, id_column]).columns
+    with open(model, "rb") as fh:
+        fitted = pickle.load(fh)
+    imp = zoo.feature_importance(fitted)
+    table = (
+        pl.DataFrame({"feature": features, "importance": imp})
+        .sort(by="importance", descending=True)
+        .with_columns(
+            model=pl.lit(model_name), target=pl.lit(target), feature_set=pl.lit(feature_set)
+        )
+    )
+    names = table["feature"].head(top).to_list()
+    if shorten_taxa:
+        names = dg.short_taxon_names(names)
+    dg.plot_top_importances(
+        names, table["importance"].to_list(), out_image, top=top, style=style
+    )
+    Path(out_table).parent.mkdir(parents=True, exist_ok=True)
+    table.write_csv(str(out_table))
+    return table
+
+
 __all__ = [
     "rank_features",
     "aggregate_features",
@@ -793,4 +978,9 @@ __all__ = [
     "fit_table_model",
     "logo_table",
     "logi_table",
+    "plot_predictions",
+    "plot_logo_predictions",
+    "plot_logi_predictions",
+    "plot_pca",
+    "plot_feature_importances",
 ]

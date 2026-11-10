@@ -1374,6 +1374,26 @@ if cv.best_model_estimator is not None and cv.best_result is not None:
     CV_Result.save_cv_result(cv.best_result, "out/best_result.ndjson")
 ```
 
+### Diagnostic figures
+
+`microbiome_ml.visualise.diagnostics` has the model-diagnostic figures as plain
+functions (arrays or frames in, a saved image or an open `Figure` out; `style`
+is a matplotlib style applied only while drawing):
+
+| function | figure |
+|---|---|
+| `plot_prediction_density` | actual vs predicted hexbin density, 1:1 and regression lines, fit statistics in the title |
+| `plot_two_panels` | two such panels (CV next to a held-out set; a group's CV next to its holdout) |
+| `plot_predictions_by_group` | the density plus a stacked error histogram coloured by a category (LOGO: the held-out group) |
+| `plot_logi_groups` | one two-panel figure per group (LOGI) |
+| `pca_embedding` + `plot_pca_overview` | PCA of the modelled features (fitted on train, test projected) coloured by group factors and by the label |
+| `plot_top_importances` | bars of the largest importances |
+
+`microbiome_ml.steps.plot_predictions`, `plot_logo_predictions`,
+`plot_logi_predictions`, `plot_pca` and `plot_feature_importances` draw them
+from the tables the other steps write (`acc,real,pred`, `acc,group,real,pred`,
+`<features>,target,acc`, a pickled model).
+
 ### Visualization
 
 ```python
