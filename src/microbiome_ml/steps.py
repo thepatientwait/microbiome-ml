@@ -337,14 +337,18 @@ def fit_table_model(
     feature_label: str = "",
     target_label: str = "",
     id_column: str = ID,
+    shuffle: bool = True,
 ) -> Dict[str, Any]:
     """Tune a model by K-fold grid search, then predict out-of-fold and test.
 
     1. ``GridSearchCV`` over ``grid`` (hyperparameters under their natural
-       names; they are addressed for the model type) with ``cv`` shuffled
-       folds, refit on all training rows.
+       names; they are addressed for the model type) with ``cv`` folds, refit
+       on all training rows.
     2. Out-of-fold predictions for the training rows with ``oof_folds``
-       shuffled folds and the best hyperparameters.
+       folds and the best hyperparameters.
+    Folds are shuffled (seed ``seed``) unless ``shuffle=False``, which uses
+    consecutive folds like ``cv=5`` in scikit-learn (for tables whose rows
+    are already in random order).
     3. If ``test`` is given, predictions and metrics for the held-out rows.
 
     Files: the fitted best estimator (pickle), the best parameters (YAML,
@@ -367,7 +371,7 @@ def fit_table_model(
     search = GridSearchCV(
         estimator,
         param_grid,
-        cv=KFold(cv, shuffle=True, random_state=seed),
+        cv=KFold(cv, shuffle=shuffle, random_state=seed if shuffle else None),
         n_jobs=n_jobs,
         refit=True,
     )
@@ -380,7 +384,11 @@ def fit_table_model(
         clone(estimator).set_params(**best_params),
         X,
         y,
-        cv=KFold(oof_folds, shuffle=True, random_state=seed),
+        cv=KFold(
+            oof_folds,
+            shuffle=shuffle,
+            random_state=seed if shuffle else None,
+        ),
         n_jobs=n_jobs,
     )
 
