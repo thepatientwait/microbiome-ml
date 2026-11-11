@@ -27,7 +27,7 @@ from typing import (
 import numpy as np
 import polars as pl
 import yaml  # type: ignore[import]
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, effective_n_jobs
 from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import make_scorer, mean_squared_error
@@ -37,12 +37,20 @@ from sklearn.model_selection import (
     PredefinedSplit,
     cross_validate,
 )
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MaxAbsScaler
+from sklearn.svm import SVR
 
 # from sklearn.linear_model import ElasticNet, LinearRegression
 # from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
 
-from microbiome_ml.train.results import CV_Result, LabelSchemeKey
+from microbiome_ml.train.full_fit import enable_oob, full_fit_diagnostics
+from microbiome_ml.train.results import (
+    CV_Result,
+    LabelSchemeKey,
+    best_candidate_index,
+)
 from microbiome_ml.wrangle.dataset import Dataset
 
 logger = logging.getLogger(__name__)
@@ -62,10 +70,59 @@ class ComboMeta(NamedTuple):
 # Mapping of model short names to their constructors
 # Canonical constructors keyed by short names (keeps compatibility with hyperparameters.yaml)
 # For now works with regressor models only (random forest, gradient boosting, xgboost)
+#
+# Seeded: an unseeded forest moved holdout R2 by up to 0.07 between two runs of
+# the same data and splits, more than the gaps between the models being ranked.
+RANDOM_STATE = 42
+
+
+class ScaledSVR(Pipeline):
+    """SVR with a linear kernel behind a MaxAbsScaler, as one estimator.
+
+    sklearn's SVR (libsvm), not LinearSVR (liblinear): the standard
+    epsilon-SVR, which leaves the intercept unpenalised and can take
+    another kernel from the grid (`svr__kernel`). The price is fit time,
+    which grows with the square of the sample count or worse.
+
+    The penalty on the coefficients is what needs the scaling. Unscaled, a
+    rare taxon peaking at 0.001 needs a coefficient 300 times larger than an
+    abundant one peaking at 0.3 to matter as much, and the penalty all but
+    forbids it. MaxAbsScaler puts each taxon on [0, 1] and leaves zeros as
+    zeros, so sparse input stays sparse.
+
+    A subclass rather than a bare Pipeline so reports name it, and so another
+    Pipeline is never mistaken for it. Grid keys take the step prefix:
+    `svr__C`, `svr__epsilon`, `svr__kernel`.
+    """
+
+    def __init__(
+        self,
+        steps: Optional[List[Tuple[str, Any]]] = None,
+        *,
+        transform_input: Optional[List[str]] = None,
+        memory: Any = None,
+        verbose: bool = False,
+    ) -> None:
+        if steps is None:
+            # cache_size: libsvm's kernel cache in MB. The default 200 is
+            # spent within a few thousand samples; past that it recomputes.
+            svr = SVR(kernel="linear", cache_size=1000)
+            steps = [("scale", MaxAbsScaler()), ("svr", svr)]
+        super().__init__(
+            steps,
+            transform_input=transform_input,
+            memory=memory,
+            verbose=verbose,
+        )
+
+
 _MODEL_CONSTRUCTORS = {
-    "rf": lambda: RandomForestRegressor(),
-    "gb": lambda: GradientBoostingRegressor(),
-    "xgb": lambda: XGBRegressor(),
+    "rf": lambda: RandomForestRegressor(random_state=RANDOM_STATE),
+    "gb": lambda: GradientBoostingRegressor(random_state=RANDOM_STATE),
+    "xgb": lambda: XGBRegressor(random_state=RANDOM_STATE),
+    # Deterministic, so no seed. Fit time grows with the square of the sample
+    # count or worse: fine at tens of thousands, not at 150,000.
+    "svm": lambda: ScaledSVR(),
 }
 
 # Alias lists map many human-friendly synonyms to the canonical short keys above
@@ -94,7 +151,24 @@ _MODEL_ALIASES = {
         "x gboost",
         "x g b",
     ],
+    "svm": [
+        "svm",
+        "svr",
+        "linear svr",
+        "linear svm",
+        "support vector",
+        "support vector machine",
+        "support vector regression",
+        "support vector regressor",
+    ],
 }
+
+
+def _set_threads(estimator: Any, n_threads: int) -> Any:
+    """Set an estimator's own thread count, where it has one."""
+    if "n_jobs" in estimator.get_params():
+        estimator.set_params(n_jobs=n_threads)
+    return estimator
 
 
 def _coerce_param_grid(raw: Optional[object]) -> object:
@@ -119,6 +193,23 @@ def _normalize_alias(name: str) -> str:
     return s
 
 
+def _sse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Sum of squared error on a fold."""
+    return float(np.sum((np.asarray(y_true) - np.asarray(y_pred)) ** 2))
+
+
+def _sst(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Total sum of squares on a fold, around that fold's own mean.
+
+    Recorded per fold because a mean of per-fold R2 cannot be reweighted
+    afterwards: pooled R2 needs the numerator and denominator separately.
+    Zero when the fold's label is constant, which is how a fold with no
+    variance to explain is told apart from one the model got wrong.
+    """
+    y = np.asarray(y_true, dtype=float)
+    return float(np.sum((y - y.mean()) ** 2))
+
+
 def _resolve_model_alias(name: str) -> str:
     """Return canonical short key for a model alias (e.g. 'random forest' ->
     'rf').
@@ -140,6 +231,40 @@ def _resolve_model_alias(name: str) -> str:
 
 
 # Define a CrossValidator class to handle cross-validation process
+def _cv_parallelism(
+    n_jobs: Optional[int], max_combos: int, cpu_total: int
+) -> Tuple[int, int]:
+    """Workers across combinations, and across one combination's folds.
+
+    Only one level fans out, to avoid nested over-subscription. A single
+    combination gives its folds the whole budget: an explicit `n_jobs` is a
+    limit, because other jobs may be sharing the node. With none set, -1
+    lets joblib count the cores this job can actually use, which on a
+    shared node can be far fewer than `cpu_total`.
+    """
+    requested = cpu_total if n_jobs is None else int(n_jobs)
+    parallel_jobs = max(1, min(requested, max_combos))
+    if parallel_jobs > 1:
+        return parallel_jobs, 1
+    return 1, -1 if n_jobs is None else max(1, requested)
+
+
+def _model_threads(
+    n_jobs: Optional[int], parallel_jobs: int, inner_cv_jobs: int
+) -> int:
+    """Threads each model may use, so the three levels share one budget.
+
+    Combination workers x fold workers x model threads stays within
+    `n_jobs`. Left to itself XGBoost takes every core the node reports
+    -- not the job's allocation -- in every worker at once, while a
+    random forest stays on one core.
+    """
+    # int(): joblib is untyped, so mypy sees its count as Any.
+    budget = int(effective_n_jobs(-1 if n_jobs is None else n_jobs))
+    folds = budget if inner_cv_jobs == -1 else max(1, inner_cv_jobs)
+    return max(1, budget // (max(1, parallel_jobs) * folds))
+
+
 class CrossValidator:
     """Base class to perform cross-validation on microbiome datasets using
     specified models and CV schemes.
@@ -152,10 +277,11 @@ class CrossValidator:
         self,
         dataset: Dataset,
         models: Union[object, List[object]],
-        cv_folds: int = 5,
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
         feature_set: Optional[Union[str, List[str]]] = None,
+        full_fit: bool = False,
+        full_fit_oob: bool = True,
     ) -> None:
         if isinstance(dataset, Dataset):
             self.dataset = dataset
@@ -173,10 +299,14 @@ class CrossValidator:
             self.models = models
         else:
             self.models = [models]
-        self.cv_folds = cv_folds
         self.label: Optional[Union[str, List[str]]] = label
         self.scheme: Optional[Union[str, List[str]]] = scheme
         self.feature_set: Optional[Union[str, List[str]]] = feature_set
+        # Score the model that is already fitted on the whole CV pool.
+        # Off by default: it costs one extra predict per combination,
+        # and with `full_fit_oob` an out-of-bag pass on every fit.
+        self.full_fit: bool = bool(full_fit)
+        self.full_fit_oob: bool = bool(full_fit_oob)
         self._best_validation_r2: float = float("-inf")
         self.best_result_key: Optional[str] = None
         self.best_result: Optional[CV_Result] = None
@@ -222,14 +352,14 @@ class CrossValidator:
             model_name = (
                 model.__class__.__name__ if model is not None else "None"
             )
-            avg_r2 = cv_result.avg_validation_r2
+            avg_r2 = cv_result.rank_score
             avg_r2_text = (
                 f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
             )
             label_text = "None" if label is None else str(label)
             best_key = self.best_result_key_by_label.get(label, "")
             print(
-                f"[best][label={label_text}] model={model_name} avg_r2={avg_r2_text} key={best_key}"
+                f"[best][label={label_text}] model={model_name} r2={avg_r2_text} key={best_key}"
             )
 
         for (label, scheme), cv_result in sorted(
@@ -243,7 +373,7 @@ class CrossValidator:
             model_name = (
                 model.__class__.__name__ if model is not None else "None"
             )
-            avg_r2 = cv_result.avg_validation_r2
+            avg_r2 = cv_result.rank_score
             avg_r2_text = (
                 f"{float(avg_r2):.6f}" if avg_r2 is not None else "None"
             )
@@ -254,7 +384,7 @@ class CrossValidator:
             )
             print(
                 f"[best][label={label_text}][scheme={scheme_text}] "
-                f"model={model_name} avg_r2={avg_r2_text} key={best_key}"
+                f"model={model_name} r2={avg_r2_text} key={best_key}"
             )
 
     @staticmethod
@@ -270,8 +400,10 @@ class CrossValidator:
         cv_result: CV_Result,
         estimator: Optional[Any] = None,
     ) -> None:
-        # Update global best model and per-label best model by average R².
-        avg_r2 = cv_result.avg_validation_r2
+        # Which result wins a label/scheme: pooled R2 when the run has it,
+        # else the mean. Same property the sweep headline ranks on, so the
+        # exported best model and the headline cannot disagree.
+        avg_r2 = cv_result.rank_score
         if avg_r2 is None:
             return
         if avg_r2 > self._best_validation_r2:
@@ -296,25 +428,6 @@ class CrossValidator:
             self.best_result_by_label_scheme[ls_key] = cv_result
             self.best_model_estimator_by_label_scheme[ls_key] = estimator
 
-    def _select_n_jobs(
-        self,
-        grid: object,
-        user_n_jobs: Optional[int],
-        params_per_job: int = 2,
-    ) -> int:
-        # Determine the number of parallel jobs for GridSearchCV, if n_jobs is None then use CPU count and
-        # number of hyperparameter combinations to estimate
-        if user_n_jobs is not None:
-            return int(user_n_jobs)
-        try:
-            combos = len(list(ParameterGrid(grid)))
-        except Exception:
-            combos = 1
-        cpus = os.cpu_count() or 1
-        # determine number of parallel jobs: one job per `params_per_job` combos
-        calc = max(1, combos // max(1, params_per_job))
-        return min(cpus, calc)
-
     def run(
         self,
         param_path: str = "parameters.yaml",
@@ -329,7 +442,7 @@ class CrossValidator:
             label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
             scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
             param_path: str = "hyperparameters.yaml" (path to YAML file with hyperparameter grids)
-            n_jobs: Optional[int] = None (number of cross-validation combinations to evaluate in parallel; defaults to detected CPU cores)
+            n_jobs: Optional[int] = None (workers for this run. Combinations run in parallel when there are several, otherwise the folds of the one combination do; defaults to detected CPU cores)
         Outputs:
             Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
         """
@@ -370,6 +483,8 @@ class CrossValidator:
         scorers = {
             "r2": "r2",
             "mse": make_scorer(mean_squared_error, greater_is_better=False),
+            "sse": make_scorer(_sse, greater_is_better=True),
+            "sst": make_scorer(_sst, greater_is_better=True),
         }
 
         def payloads() -> (
@@ -410,6 +525,12 @@ class CrossValidator:
                     continue
 
                 unique_folds, counts = np.unique(fold_arr, return_counts=True)
+                # PredefinedSplit reads -1 as "always train, never validate";
+                # leave-one-group-out parks single-sample groups there. It is
+                # not a fold, so it must not be counted as one nor trip the
+                # fold-size check below.
+                _keep = unique_folds >= 0
+                unique_folds, counts = unique_folds[_keep], counts[_keep]
                 if len(unique_folds) < 2:
                     logging.warning(
                         "Not enough folds for %s (found %d); skipping",
@@ -455,17 +576,17 @@ class CrossValidator:
             * _n(label_to_use, 1)
             * _n(scheme_to_use, 1)
         )
-        requested = cpu_total if n_jobs is None else int(n_jobs)
-        parallel_jobs = max(1, min(requested, max_combos))
-
-        # Avoid nested over-subscription: only fan-out inside cross_validate when sequential
-        inner_cv_jobs = -1 if parallel_jobs == 1 else 1
+        parallel_jobs, inner_cv_jobs = _cv_parallelism(
+            n_jobs, max_combos, cpu_total
+        )
+        model_threads = _model_threads(n_jobs, parallel_jobs, inner_cv_jobs)
 
         logger.info(
             "Dispatching CV combinations across %d worker(s) "
-            "(inner_cv_jobs=%d)",
+            "(inner_cv_jobs=%d, model_threads=%d)",
             parallel_jobs,
             inner_cv_jobs,
+            model_threads,
         )
 
         parallel = Parallel(n_jobs=parallel_jobs)
@@ -476,6 +597,9 @@ class CrossValidator:
                 params_grid,
                 scorers,
                 inner_cv_jobs,
+                self.full_fit,
+                self.full_fit_oob,
+                model_threads,
             )
             for payload in payloads()
         )
@@ -512,11 +636,19 @@ class CrossValidator:
         params_grid: Dict[str, Any],
         scorers: Dict[str, Any],
         inner_cv_jobs: int,
+        full_fit: bool = False,
+        full_fit_oob: bool = True,
+        model_threads: Optional[int] = None,
     ) -> Tuple[
         str,
         Dict[str, CV_Result],
         Optional[Tuple[str, CV_Result, Any, float]],
     ]:
+        """CV every model and setting on one combination.
+
+        `model_threads` sets each estimator's own n_jobs (see
+        `_model_threads`); None leaves the library default.
+        """
         (
             key,
             feature_name,
@@ -537,6 +669,8 @@ class CrossValidator:
                 for params in ParameterGrid(grid):
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                     estimator.set_params(**params)
+                    if model_threads:
+                        _set_threads(estimator, model_threads)
                     cvres = cross_validate(
                         estimator,
                         X_arr,
@@ -548,9 +682,15 @@ class CrossValidator:
                     )
                     per_r2 = list(cvres["test_r2"])
                     per_mse = [-m for m in cvres["test_mse"]]
+                    per_sse = list(cvres["test_sse"])
+                    per_sst = list(cvres["test_sst"])
                     result_key = (
                         f"{key}::{estimator.__class__.__name__}::{params}"
                     )
+                    # Asked for before the fit, so the out-of-bag pass
+                    # rides along with it instead of costing a refit.
+                    if full_fit and full_fit_oob:
+                        enable_oob(estimator)
                     estimator.fit(X_arr, y_arr)
                     cv_result = CV_Result(
                         feature_set=feature_name,
@@ -559,12 +699,15 @@ class CrossValidator:
                         cross_val_scores=per_r2,
                         validation_r2_per_fold=per_r2,
                         validation_mse_per_fold=per_mse,
+                        validation_sse_per_fold=per_sse,
+                        validation_sst_per_fold=per_sst,
                         best_params=dict(params),
                         trained_model=estimator,
                         feature_names=feature_names,
+                        n_label=len(y_arr),
                     )
                     results[result_key] = cv_result
-                    avg_r2 = cv_result.avg_validation_r2
+                    avg_r2 = cv_result.rank_score
                     if avg_r2 is not None and (
                         best_info is None or avg_r2 > best_info[3]
                     ):
@@ -579,6 +722,8 @@ class CrossValidator:
             for params in ParameterGrid(grid):
                 estimator = clone(model)
                 estimator.set_params(**params)
+                if model_threads:
+                    _set_threads(estimator, model_threads)
                 cvres = cross_validate(
                     estimator,
                     X_arr,
@@ -590,7 +735,11 @@ class CrossValidator:
                 )
                 per_r2 = list(cvres["test_r2"])
                 per_mse = [-v for v in cvres["test_mse"]]
+                per_sse = list(cvres["test_sse"])
+                per_sst = list(cvres["test_sst"])
                 result_key = f"{key}::{estimator.__class__.__name__}::{params}"
+                if full_fit and full_fit_oob:
+                    enable_oob(estimator)
                 estimator.fit(X_arr, y_arr)
                 cv_result = CV_Result(
                     feature_set=feature_name,
@@ -599,12 +748,15 @@ class CrossValidator:
                     cross_val_scores=per_r2,
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
+                    validation_sse_per_fold=per_sse,
+                    validation_sst_per_fold=per_sst,
                     best_params=dict(params),
                     trained_model=estimator,
                     feature_names=feature_names,
+                    n_label=len(y_arr),
                 )
                 results[result_key] = cv_result
-                avg_r2 = cv_result.avg_validation_r2
+                avg_r2 = cv_result.rank_score
                 if avg_r2 is not None and (
                     best_info is None or avg_r2 > best_info[3]
                 ):
@@ -613,27 +765,43 @@ class CrossValidator:
                     f"Completed CV for {result_key} with params {params}"
                 )
 
+        # Only the combination's own winner is diagnosed. Every config
+        # was already fitted on the full pool above, but scoring all of
+        # them would cost a predict over the whole training set per
+        # config to describe models nothing downstream will look at.
+        if full_fit and best_info is not None:
+            _, best_cv_result, best_estimator, best_score = best_info
+            best_cv_result.full_fit = full_fit_diagnostics(
+                best_estimator, X_arr, y_arr, cv_score=best_score
+            )
+
         return key, results, best_info
 
     def run_grid(
         self,
         param_path: str = "hyperparameters.yaml",
         n_jobs: Optional[int] = None,
-        params_per_job: int = 2,
     ) -> dict:
-        """Performs grid search cross-validation using predefined splits.
+        """One sklearn GridSearchCV per feature set x label x scheme x model.
+
+        Every candidate is scored by GridSearchCV on the predefined folds.
+        Each estimator trains on one thread and GridSearchCV spreads the fits
+        across `n_jobs` workers, so the two levels never multiply. The winner
+        is the best pooled R2, the score the rest of the workflow ranks on,
+        and is then refit once with all `n_jobs` threads.
 
         Inputs:
-            label: Union[str, List[str]] = None (specific label(s) to use; defaults to self.label or all label attributes in dataset)
-            scheme: Union[str, List[str]] = None (specific CV scheme(s) to use; defaults to all schemes in dataset)
-            feature_set: Union[str, List[str]] = None (specific feature set(s) to use; defaults to all feature sets in dataset)
-            param_path: str = "hyperparameters.yaml" (path to YAML file with hyperparameter grids)
-            n_jobs: Optional[int] = None (number of parallel jobs for GridSearchCV; if None, auto-determined)
-            params_per_job: int = 2 (used if n_jobs is None; number of hyperparameter combinations per job to estimate n_jobs)
+            param_path: YAML of grids, one top-level key per model.
+            n_jobs: Workers for this run. None uses every core this job can
+                actually use, as counted by joblib.
         Outputs:
-            Dict[str, CV_Result]: A dictionary mapping each unique combination of feature set, label, scheme, model, and hyperparameters to its CV_Result.
+            Dict[str, CV_Result]: the winner per feature set x label x scheme
+            x model. `grid_results` on each holds sklearn's `cv_results_` for
+            all its candidates; `CV_Result.export_result` writes those to
+            `grid_results.csv`.
         """
         self._reset_best_tracking()
+        workers = effective_n_jobs(-1 if n_jobs is None else n_jobs)
 
         # Determine label and scheme to use
         labels_attr = getattr(self.dataset, "labels", None)
@@ -663,6 +831,8 @@ class CrossValidator:
         scorers = {
             "r2": "r2",
             "mse": make_scorer(mean_squared_error, greater_is_better=False),
+            "sse": make_scorer(_sse, greater_is_better=True),
+            "sst": make_scorer(_sst, greater_is_better=True),
         }
 
         for key, X_np, y_np, meta in mapping:
@@ -684,6 +854,12 @@ class CrossValidator:
                 continue
 
             unique_folds, counts = np.unique(fold_arr, return_counts=True)
+            # PredefinedSplit reads -1 as "always train, never validate";
+            # leave-one-group-out parks single-sample groups there. It is
+            # not a fold, so it must not be counted as one nor trip the
+            # fold-size check below.
+            _keep = unique_folds >= 0
+            unique_folds, counts = unique_folds[_keep], counts[_keep]
             if len(unique_folds) < 2:
                 logging.warning(
                     "Not enough folds for %s (found %d); skipping",
@@ -706,7 +882,16 @@ class CrossValidator:
             for model in self.models:
                 if isinstance(model, str):
                     model_key = _resolve_model_alias(model)
-                    grid = _coerce_param_grid(param_grids.get(model_key, [{}]))
+                    # An empty `rf:` means defaults on purpose. A missing key
+                    # is a typo or a commented-out block, and searching
+                    # nothing would still report a "winner".
+                    if model_key not in param_grids:
+                        raise ValueError(
+                            f"No grid for model '{model}' in {param_path}: "
+                            f"expected the key '{model_key}', found "
+                            f"{sorted(param_grids)}"
+                        )
+                    grid = _coerce_param_grid(param_grids[model_key])
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                 else:
                     # estimator instance: prefer class-name key, then canonical short keys
@@ -726,21 +911,31 @@ class CrossValidator:
                             if canon is not None
                             else [{}]
                         )
-                    estimator = model
+                    estimator = clone(model)
                     if raw_grid is not None:
                         grid = _coerce_param_grid(raw_grid)
-                n_jobs_use = self._select_n_jobs(grid, n_jobs, params_per_job)
+                # refit=False, because sklearn's refit would run on one
+                # thread and pick by mean R2. Refitting below uses the whole
+                # budget, and asks for the out-of-bag score on this one fit
+                # rather than on every candidate.
                 gs = GridSearchCV(
-                    estimator=estimator,
+                    estimator=_set_threads(estimator, 1),
                     param_grid=grid,
                     cv=ps,
                     scoring=scorers,
-                    refit="r2",
-                    n_jobs=n_jobs_use,
+                    refit=False,
+                    n_jobs=workers,
                 )
                 gs.fit(X_arr, y_arr)
                 cvres = gs.cv_results_
-                best_idx = gs.best_index_
+                best_idx = best_candidate_index(cvres)
+                best_params = dict(cvres["params"][best_idx])
+                best_estimator = _set_threads(
+                    clone(estimator).set_params(**best_params), workers
+                )
+                if self.full_fit and self.full_fit_oob:
+                    enable_oob(best_estimator)
+                best_estimator.fit(X_arr, y_arr)
                 n_splits = ps.get_n_splits()
                 per_r2 = [
                     cvres[f"split{i}_test_r2"][best_idx]
@@ -750,9 +945,16 @@ class CrossValidator:
                     -cvres[f"split{i}_test_mse"][best_idx]
                     for i in range(n_splits)
                 ]  # negate because scorer is neg MSE
+                per_sse = [
+                    cvres[f"split{i}_test_sse"][best_idx]
+                    for i in range(n_splits)
+                ]
+                per_sst = [
+                    cvres[f"split{i}_test_sst"][best_idx]
+                    for i in range(n_splits)
+                ]
 
-                result_key = f"{key}::{gs.best_estimator_.__class__.__name__}"
-                best_params = getattr(gs, "best_params_", None)
+                result_key = f"{key}::{best_estimator.__class__.__name__}"
                 cv_result = CV_Result(
                     feature_set=feature_name,
                     label=label_name,
@@ -760,18 +962,33 @@ class CrossValidator:
                     cross_val_scores=per_r2,
                     validation_r2_per_fold=per_r2,
                     validation_mse_per_fold=per_mse,
+                    validation_sse_per_fold=per_sse,
+                    validation_sst_per_fold=per_sst,
                     best_params=best_params,
-                    trained_model=gs.best_estimator_,
+                    trained_model=best_estimator,
                     feature_names=feature_columns,
+                    n_label=len(y_arr),
+                    grid_results=cvres,
                 )
+                if self.full_fit:
+                    cv_result.full_fit = full_fit_diagnostics(
+                        best_estimator,
+                        X_arr,
+                        y_arr,
+                        cv_score=cv_result.rank_score,
+                    )
                 results[result_key] = cv_result
                 self._update_best_model(
-                    result_key, cv_result, estimator=gs.best_estimator_
+                    result_key, cv_result, estimator=best_estimator
                 )
                 logger.info(
-                    f"Completed grid search CV for {result_key} with best params {best_params} and per-fold R²: {per_r2}"
+                    "Grid search %s: best of %d candidate(s) is %s, pooled "
+                    "R2 %s",
+                    result_key,
+                    len(cvres["params"]),
+                    best_params,
+                    cv_result.rank_score,
                 )
-                logger.info(f"Best hyperparameters: {gs.best_params_}\n")
 
         self._print_best_models_by_label()
         return results
@@ -1084,13 +1301,14 @@ class CrossValidator:
                     joined = (
                         keys.lazy()
                         .join(feat_lf, on="sample", how="left")
+                        # One expression over all the feature columns,
+                        # not one per column: a genus table has ~60k of
+                        # them, and polars' optimiser walking 60k
+                        # expression nodes is itself a memory problem.
                         .with_columns(
-                            [
-                                pl.col(c)
-                                .fill_null(fillna)
-                                .cast(pl.Float32, strict=False)
-                                for c in feature_cols
-                            ]
+                            pl.col(feature_cols)
+                            .fill_null(fillna)
+                            .cast(pl.Float32, strict=False)
                         )
                         .collect()
                     )

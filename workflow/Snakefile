@@ -18,6 +18,8 @@
 #                                 -> <base>/<run>/runs/<label>/<scheme>/
 #   collate  (1)                  TSV summaries
 #                                 -> <base>/cv_sweep_headline.tsv, ...
+#   feature_report (1)            rank comparison + importance spread
+#                                 -> <base>/feature_report/
 #
 # collate reads every <base>/holdout_*/ on disk, not only the runs of this
 # invocation, so a later sweep extends the summary TSVs rather than
@@ -45,6 +47,13 @@ if "data" not in config or "outputs" not in config:
 # ---------------------------------------------------------------------------
 REPO = Path(workflow.basedir).parent
 STEPS = f"python -u {shlex.quote(str(REPO / 'scripts' / 'pipeline_steps.py'))}"
+# Its own entry point rather than a pipeline_steps subcommand: the report
+# only reads finished CSVs, so it stays runnable by hand against any
+# output directory, sweep or not.
+FEATREP = (
+    "python -u "
+    f"{shlex.quote(str(REPO / 'scripts' / 'rank_feature_report.py'))}"
+)
 
 # Token parsing only -- a dependency-free module. Importing pipeline_steps
 # here would pull in microbiome_ml, whose setup_logging() configures the
@@ -59,67 +68,15 @@ BASE_S = str(BASE)
 
 
 def _run_specs():
-    """The runs this sweep performs, as {dir_name: spec}.
-
-    Two modes:
-      sweep.holdout_groupings: [random, bioproject, "taxon:family"]
-          every grouping x every label -- the cross-product.
-      sweep.pairs: {geo_ph: organism, geo_temperature: realm}
-          one run per label, each with its own holdout grouping.
-    `pairs` wins if both are given. A pair run restricts the label at
-    every stage, so a label without a holdout cannot trip up CV.
-    """
+    """The runs this sweep performs; see sweep_tokens.run_specs."""
     sweep = config.get("sweep") or {}
-    pairs = config.get("pairs") or sweep.get("pairs")
-    if pairs:
-        if isinstance(pairs, str):  # --config pairs=geo_ph:organism,...
-            pairs = dict(
-                item.split(":", 1) for item in pairs.split(",") if item
-            )
-        if not isinstance(pairs, dict):
-            raise WorkflowError(
-                "sweep.pairs must be a mapping of label -> holdout grouping"
-            )
-        specs = {}
-        for label, tokens in pairs.items():
-            # A label may name several groupings; each becomes its own run,
-            # so adding one later does not disturb the runs already done.
-            if tokens is None or isinstance(tokens, str):
-                tokens = [tokens]
-            elif not isinstance(tokens, (list, tuple)):
-                raise WorkflowError(
-                    f"sweep.pairs[{label}] must be a grouping or a list of "
-                    f"groupings, got {tokens!r}"
-                )
-            for token in tokens:
-                token = "random" if token is None else str(token).strip()
-                gname = steps.spec_dir_name(token)
-                specs[f"holdout_{gname}__{label}"] = {
-                    "token": token,
-                    "label": str(label),
-                    "stamp": f"{gname}__{label}",
-                }
-        return specs
-
-    raw = config.get("holdout_groupings") or sweep.get("holdout_groupings")
-    if raw is None:
-        raise WorkflowError(
-            "Nothing to sweep. Give either sweep.holdout_groupings "
-            "([random, bioproject, ...]) or sweep.pairs "
-            "({label: grouping}); --config holdout_groupings=... and "
-            "--config pairs=label:grouping,... also work."
+    try:
+        return steps.run_specs(
+            config.get("pairs") or sweep.get("pairs"),
+            config.get("holdout_groupings") or sweep.get("holdout_groupings"),
         )
-    if isinstance(raw, str):
-        raw = [x for x in raw.split(",")]
-    specs = {}
-    for g in raw:
-        token = "random" if g is None else str(g).strip()
-        gname = steps.spec_dir_name(token)
-        specs.setdefault(
-            f"holdout_{gname}",
-            {"token": token, "label": None, "stamp": gname},
-        )
-    return specs
+    except ValueError as exc:
+        raise WorkflowError(str(exc)) from exc
 
 
 RUNS = _run_specs()
@@ -141,6 +98,17 @@ CV_ENABLED = bool((config.get("cv") or {}).get("enabled", True))
 HOLDOUT_ENABLED = bool(
     (config.get("holdout_evaluation") or {}).get("enabled", True)
 )
+# Rank comparison + importance concentration, read straight off the CV
+# exports. Nothing is refitted and no model is unpickled, so it is on by
+# default; feature_report: {enabled: false} skips it.
+_FEATREP_CFG = config.get("feature_report") or {}
+FEATREP_ENABLED = CV_ENABLED and bool(_FEATREP_CFG.get("enabled", True))
+_coverage = _FEATREP_CFG.get("coverage") or [0.5, 0.9, 0.95]
+if isinstance(_coverage, str):  # --config feature_report_coverage=.5,.9
+    _coverage = [c for c in _coverage.replace(",", " ").split() if c]
+FEATREP_COVERAGE = " ".join(str(float(c)) for c in _coverage)
+FEATREP_TOP = int(_FEATREP_CFG.get("top", 25))
+FEATREP_PREFIX = str((config.get("features") or {}).get("prefix", "tax"))
 # Per-rule resources, in Snakemake's standard names (threads, mem_mb, runtime
 # in minutes) so an executor profile can map them to the queue. Override any
 # of them in the YAML:
@@ -158,6 +126,9 @@ _DEFAULT_RESOURCES = {
         "runtime": 12 * 60,
     },
     "collate": {"threads": 1, "mem_mb": 4000, "runtime": 15},
+    # Reads every feature_importances.csv at once; one row per feature per
+    # combination, so genus-scale sweeps need more than collate does.
+    "feature_report": {"threads": 1, "mem_mb": 16000, "runtime": 30},
 }
 _USER_RESOURCES = (config.get("sweep") or {}).get("resources") or {}
 
@@ -168,7 +139,13 @@ _USER_RESOURCES = (config.get("sweep") or {}).get("resources") or {}
 # Tune in the YAML:  sweep: {mem_scale: 2.0, retries: {prepare: 3}}
 _SWEEP = config.get("sweep") or {}
 MEM_SCALE = float(_SWEEP.get("mem_scale", 2.0))
-_DEFAULT_RETRIES = {"prepare": 2, "split": 2, "cv": 2, "collate": 0}
+_DEFAULT_RETRIES = {
+    "prepare": 2,
+    "split": 2,
+    "cv": 2,
+    "collate": 0,
+    "feature_report": 0,
+}
 _USER_RETRIES = _SWEEP.get("retries") or {}
 
 
@@ -256,6 +233,12 @@ COLLATED = (
     if CV_ENABLED
     else []
 )
+if FEATREP_ENABLED:
+    COLLATED.append(f"{BASE_S}/feature_report/feature_report.txt")
+
+
+# Quick and light, so on a cluster they run inside the Snakemake process.
+localrules: split, split_report, collate, feature_report
 
 
 rule all:
@@ -374,6 +357,32 @@ rule split_report:
     shell:
         "{LOGHDR} "
         "{STEPS} split_report --out {BASE_S} >> {log} 2>&1"
+
+
+rule feature_report:
+    # Which rank earns its cost, and how few features carry the
+    # importance. Takes the same inputs as collate rather than collate's
+    # output, so the two run in parallel and this one can be redone on
+    # its own after changing feature_report.coverage:
+    #   snakemake ... -R feature_report
+    input:
+        schemes=ALL_SCHEMES,
+        runs=all_runs,
+    output:
+        report=f"{BASE_S}/feature_report/feature_report.txt",
+    threads: RES("feature_report", "threads")
+    retries: RETRIES("feature_report")
+    resources:
+        mem_mb=MEM("feature_report"),
+        runtime=RUNTIME("feature_report"),
+    log:
+        f"{BASE_S}/logs/feature_report.log",
+    shell:
+        "{LOGHDR} "
+        "{FEATREP} --root {BASE_S} --out {BASE_S}/feature_report "
+        "--coverage {FEATREP_COVERAGE} --top {FEATREP_TOP} "
+        "--prefix {FEATREP_PREFIX} >> {log} 2>&1"
+
 
 rule collate:
     input:
