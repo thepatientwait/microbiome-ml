@@ -39,10 +39,20 @@ from sweep_tokens import (  # noqa: E402,F401
 )
 
 from microbiome_ml.train.cv import CrossValidator  # noqa: E402
+from microbiome_ml.train.full_fit import write_full_fit_report  # noqa: E402
 from microbiome_ml.train.results import CV_Result  # noqa: E402
 from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
+from microbiome_ml.transforms.labels import (  # noqa: E402
+    label_variants,
+    split_label_variant,
+)
 from microbiome_ml.visualise.visualisations import Visualiser  # noqa: E402
-from microbiome_ml.wrangle.dataset import Dataset  # noqa: E402
+from microbiome_ml.wrangle import recipe as feature_recipe  # noqa: E402
+from microbiome_ml.wrangle.dataset import (  # noqa: E402
+    Dataset,
+    feature_set_name,
+    rank_from_feature_set,
+)
 from microbiome_ml.wrangle.splits import SplitManager  # noqa: E402
 
 LOGGER = logging.getLogger("steps")
@@ -108,6 +118,75 @@ def _attach_splits(
     return dataset
 
 
+def recipe_set_name(features_cfg: Dict[str, Any]) -> str:
+    """The name a `features.base_set` recipe's feature set goes by.
+
+    The same name prepare would give it (tax_order_clr_bio), so tables
+    and reports read as before. Prevalence, ICC and variance cutoffs are
+    not in it; a sweep keeps those apart by directory.
+    """
+    prefix = str(features_cfg.get("prefix", "tax"))
+    base = str(features_cfg["base_set"])
+    rank = rank_from_feature_set(base, prefix)
+    if rank is None:
+        raise ValueError(
+            f"features.base_set={base!r} is not a {prefix}_<rank> set"
+        )
+    return feature_set_name(
+        prefix,
+        rank,
+        features_cfg.get("transform", "relabund"),
+        features_cfg.get("prevalence_by") or None,
+    )
+
+
+def _apply_recipe(
+    dataset: Dataset,
+    features_cfg: Dict[str, Any],
+    label: str,
+    run_dir: Path,
+) -> str:
+    """Build this job's feature set from `features.base_set`; its name.
+
+    The selection is fitted on the holdout's training samples for
+    *label* (see wrangle/recipe.py), and the per-taxon table that says
+    what each step dropped is written to feature_selection.tsv.
+    """
+    holdout = dataset.splits[label].holdout
+    if holdout is None or "split" not in holdout.columns:
+        raise ValueError(f"no holdout split for {label!r} to fit on")
+    fit = (
+        holdout.filter(pl.col("split") == "train")
+        .get_column("sample")
+        .to_list()
+    )
+    name = recipe_set_name(features_cfg)
+    feature_recipe.apply_to_dataset(
+        dataset,
+        features_cfg,
+        fit,
+        name,
+        report_path=run_dir / "feature_selection.tsv",
+    )
+    return name
+
+
+def _as_variant(dataset: Dataset, base: str, variant: str) -> Dataset:
+    """Train *variant* (`ph@yeo_johnson`) on *base*'s values and split.
+
+    A copy of the label column under the variant's name, and the split
+    keyed by it, so every table, report and figure downstream keeps the
+    transforms apart while each one is tested on the same samples.
+    """
+    if dataset.labels is None or base not in dataset.labels.columns:
+        raise ValueError(f"Label {base!r} not in the dataset")
+    dataset.labels = dataset.labels.with_columns(pl.col(base).alias(variant))
+    manager = dataset.splits[base]
+    manager.label = variant
+    dataset.splits = {variant: manager}
+    return dataset
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -138,7 +217,9 @@ def step_split(args: argparse.Namespace) -> None:
     run_name = getattr(args, "run_name", None) or spec_dir_name(args.grouping)
     out = Path(args.out)
 
-    dataset = Dataset.load(args.dataset)
+    # Before the split, so values outside data.label_limits are in
+    # neither the holdout nor the folds.
+    dataset = pipeline.clean_labels(Dataset.load(args.dataset), cfg)
 
     if kind == "taxon":
         dataset = dataset.create_taxon_holdout_split(
@@ -152,6 +233,32 @@ def step_split(args: argparse.Namespace) -> None:
             force=True,
             output_dir=out,
         )
+    elif kind == "spatial":
+        # Grid cells (`spatial`) or site clusters (`spatial_cluster`), and a
+        # haversine buffer; sizes from split.holdout.spatial (auto by
+        # default). See wrangle/spatial.py.
+        dataset = dataset.create_spatial_holdout_split(
+            label=holdout_cfg.get("label"),
+            test_size=float(holdout_cfg.get("test_size", 0.2)),
+            n_bins=int(holdout_cfg.get("n_bins", 5)),
+            random_state=int(holdout_cfg.get("random_state", 42)),
+            spatial=holdout_cfg.get("spatial"),
+            force=True,
+            output_dir=out,
+            method=value or "grid",
+        )
+        for row in dataset.spatial_report.iter_rows(named=True):
+            LOGGER.info(
+                "spatial holdout %s (%s): %s groups, buffer %s km, "
+                "%s train / %s buffer / %s test",
+                row["label"],
+                row["method"],
+                row["n_groups"],
+                row["buffer_km"],
+                row["n_train"],
+                row["n_buffer"],
+                row["n_test"],
+            )
     else:
         dataset = _ensure_grouping(dataset, value)
         dataset = dataset.create_holdout_split(
@@ -172,6 +279,8 @@ def step_split(args: argparse.Namespace) -> None:
         use_holdout=bool(split_cv_cfg.get("use_holdout", True)),
         force=True,
         strict=bool(split_cv_cfg.get("strict", True)),
+        methods=split_cv_cfg.get("methods", "kfold"),
+        logo_max_groups=int(split_cv_cfg.get("logo_max_groups", 50)),
     )
     dataset.save_cv_folds(out)
 
@@ -180,7 +289,19 @@ def step_split(args: argparse.Namespace) -> None:
         out,
         sec["visualise"],
         out.parent / "split_visualisations",
+        # run_name is the directory stamp (e.g. bioproject__temperature)
+        # and names the run in the report; the bars stack by the metadata
+        # column, which is what `value` holds.
         holdout_grouping=run_name,
+        stack_by=value if kind == "column" else None,
+    )
+    # Where the samples are, train / test / buffer (visualise.holdout_map;
+    # auto = spatial holdouts only).
+    pipeline.plot_holdout_maps(
+        out,
+        sec["visualise"],
+        out.parent / "split_visualisations",
+        spatial=kind == "spatial",
     )
 
     # What the cv step should actually train, honouring cv.label / cv.scheme.
@@ -210,7 +331,12 @@ def step_split(args: argparse.Namespace) -> None:
             if want_schemes is None or s in want_schemes
         ]
         if names:
-            schemes[label] = sorted(names)
+            # One CV job per transform of the label (cv.target_transform),
+            # all on this one split: `ph`, `ph@yeo_johnson`, ...
+            for variant in label_variants(
+                label, cv_cfg.get("target_transform")
+            ):
+                schemes[variant] = sorted(names)
     if not bool(cv_cfg.get("enabled", True)):
         # Record the schemes even when CV is off: the workflow gates on
         # cv.enabled itself, and writing an empty list here would make
@@ -227,10 +353,15 @@ def step_split(args: argparse.Namespace) -> None:
 def step_cv(args: argparse.Namespace) -> None:
     cfg = _load_cfg(args)
     sec = pipeline._sections(cfg)
-    split_cv_cfg = sec["split"].get("cv") or {}
+    sec["split"].get("cv") or {}
     cv_cfg, out_cfg = sec["cv"], sec["outputs"]
     vis_cfg, shap_cfg = sec["visualise"], sec["shap"]
     holdout_enabled = bool(sec["holdout_evaluation"].get("enabled", True))
+    # Whole-training-pool diagnostics. The CV stage already fits the
+    # winner on every CV row to read importances off it; this scores
+    # that same fit instead of letting it go unmeasured.
+    final_fit_cfg = sec["final_fit"]
+    final_fit_on = bool(final_fit_cfg.get("enabled", False))
     holdout_grouping = getattr(args, "run_name", None) or spec_dir_name(
         args.grouping
     )
@@ -246,8 +377,16 @@ def step_cv(args: argparse.Namespace) -> None:
         "error": "",
     }
 
-    dataset = Dataset.load(args.dataset)
-    dataset = _attach_splits(dataset, Path(args.splits), label, scheme)
+    dataset = pipeline.clean_labels(Dataset.load(args.dataset), cfg)
+    # `ph@yeo_johnson`: ph's values and split, trained on that transform.
+    base_label, target_transform = split_label_variant(label)
+    dataset = _attach_splits(dataset, Path(args.splits), base_label, scheme)
+    if label != base_label:
+        dataset = _as_variant(dataset, base_label, label)
+    feature_set = cv_cfg.get("feature_set")
+    if sec["features"].get("base_set"):
+        # One prepared base table, this job's selection and transform.
+        feature_set = [_apply_recipe(dataset, sec["features"], label, run_dir)]
 
     models = cv_cfg.get("models", ["rf"])
     if not isinstance(models, list):
@@ -255,21 +394,20 @@ def step_cv(args: argparse.Namespace) -> None:
     cv = CrossValidator(
         dataset=dataset,
         models=models,
-        cv_folds=int(split_cv_cfg.get("n_folds", 5)),
         label=label,
         scheme=scheme,
-        feature_set=cv_cfg.get("feature_set"),
+        feature_set=feature_set,
+        full_fit=final_fit_on,
+        full_fit_oob=bool(final_fit_cfg.get("oob", True)),
+        sparse=cv_cfg.get("sparse", "auto"),
+        target_transform=target_transform,
     )
     mode = str(cv_cfg.get("mode", "run")).strip().lower()
     param_path = str(cv_cfg.get("param_path", "parameters.yaml"))
     n_jobs_raw = cv_cfg.get("n_jobs")
     n_jobs = None if n_jobs_raw is None else int(n_jobs_raw)
     if mode == "run_grid":
-        results = cv.run_grid(
-            param_path=param_path,
-            n_jobs=n_jobs,
-            params_per_job=int(cv_cfg.get("params_per_job", 2)),
-        )
+        results = cv.run_grid(param_path=param_path, n_jobs=n_jobs)
     elif mode == "run":
         results = cv.run(param_path=param_path, n_jobs=n_jobs)
     else:
@@ -295,6 +433,13 @@ def step_cv(args: argparse.Namespace) -> None:
     )
     pipeline._log_best_combinations(cv)
 
+    if final_fit_on:
+        write_full_fit_report(
+            cv.best_result_by_label_scheme or {},
+            run_dir / "final_fit",
+            top_n=int(final_fit_cfg.get("top_n", 20)),
+        )
+
     vis_enabled = bool(vis_cfg.get("enabled", False))
     vis_formats = list(vis_cfg.get("formats", ["png"]))
     top_n = int(vis_cfg.get("top_n", 20))
@@ -311,6 +456,7 @@ def step_cv(args: argparse.Namespace) -> None:
             dataset=dataset,
             best_result=cv.best_result_by_label_scheme,
             output_model_path=holdout_out,
+            sparse=cv_cfg.get("sparse", "auto"),
         )
         evaluation = trainer.train_and_evaluate(
             compute_shap=shap_enabled,
@@ -402,6 +548,19 @@ _HEADLINE_NEEDS = (
 )
 
 
+# Carried into the headline when the run produced them. pooled_validation_r2
+# is the ranking key: an unweighted mean of per-fold R2 lets one fold with
+# almost no variance to explain set the whole number.
+_HEADLINE_EXTRAS = (
+    "pooled_validation_r2",
+    "median_validation_r2",
+    "iqr_validation_r2",
+    "frac_folds_negative_r2",
+    "n_folds_evaluable",
+    "n_folds",
+)
+
+
 def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
     """One row per holdout grouping x label: `random` vs the best grouped CV
     scheme, with the feature set and model each of them chose.
@@ -416,13 +575,25 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
         LOGGER.warning("headline table skipped; missing columns %s", missing)
         return None
 
+    numeric = ["avg_validation_r2", *(_HEADLINE_EXTRAS)]
     df = best.with_columns(
-        pl.col("avg_validation_r2").cast(pl.Float64, strict=False)
+        [
+            pl.col(c).cast(pl.Float64, strict=False)
+            for c in numeric
+            if c in best.columns
+        ]
+    )
+    # Rank on pooled R2 where the run recorded it, else the old mean, so a
+    # sweep collated from a mix of old and new runs still produces a table.
+    rank_on = (
+        "pooled_validation_r2"
+        if "pooled_validation_r2" in df.columns
+        else "avg_validation_r2"
     )
 
     def _top(frame: pl.DataFrame, prefix: str) -> pl.DataFrame:
         picked = (
-            frame.sort("avg_validation_r2", descending=True, nulls_last=True)
+            frame.sort(rank_on, descending=True, nulls_last=True)
             .group_by(["holdout_grouping", "label"], maintain_order=True)
             .first()
         )
@@ -436,6 +607,10 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
         if "avg_validation_mse" in picked.columns:
             rename["avg_validation_mse"] = f"{prefix}_mse"
             keep.append("avg_validation_mse")
+        for col in _HEADLINE_EXTRAS:
+            if col in picked.columns:
+                rename[col] = f"{prefix}_{col.replace('_validation', '')}"
+                keep.append(col)
         return picked.select(keep).rename(rename)
 
     control = _top(df.filter(pl.col("scheme") == "random"), "control")
@@ -444,15 +619,34 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
     table = control.join(
         grouped, on=["holdout_grouping", "label"], how="full", coalesce=True
     )
-    if {"control_r2", "best_grouped_r2"} <= set(table.columns):
+    # n_label is a property of the label, not of either scheme, so it is
+    # carried once rather than prefixed onto both sides.
+    if "n_label" in df.columns:
+        table = table.join(
+            df.group_by(["holdout_grouping", "label"]).agg(
+                pl.col("n_label").max().alias("n_label")
+            ),
+            on=["holdout_grouping", "label"],
+            how="left",
+        )
+    gap_on = (
+        "pooled_r2"
+        if {"control_pooled_r2", "best_grouped_pooled_r2"}
+        <= set(table.columns)
+        else "r2"
+    )
+    if {f"control_{gap_on}", f"best_grouped_{gap_on}"} <= set(table.columns):
         table = table.with_columns(
-            (pl.col("control_r2") - pl.col("best_grouped_r2")).alias("r2_gap")
+            (
+                pl.col(f"control_{gap_on}") - pl.col(f"best_grouped_{gap_on}")
+            ).alias("r2_gap")
         )
     order = [
         c
         for c in (
             "holdout_grouping",
             "label",
+            "n_label",
             "control_scheme",
             "control_feature_set",
             "control_model",
@@ -463,7 +657,14 @@ def headline_table(best: pl.DataFrame) -> Optional[pl.DataFrame]:
             "best_grouped_model",
             "best_grouped_r2",
             "best_grouped_mse",
+            "control_pooled_r2",
+            "best_grouped_pooled_r2",
             "r2_gap",
+            "best_grouped_median_r2",
+            "best_grouped_iqr_r2",
+            "best_grouped_frac_folds_negative_r2",
+            "best_grouped_n_folds_evaluable",
+            "best_grouped_n_folds",
         )
         if c in table.columns
     ]
@@ -531,8 +732,18 @@ def fold_profile(root: Union[str, Path]) -> Optional[pl.DataFrame]:
         df = pl.read_csv(path)
         if "fold" not in df.columns or not df.height:
             continue
-        sizes = df.group_by("fold").len().sort("fold")["len"].to_list()
-        total = sum(sizes)
+        # fold -1 is leave-one-group-out's training-only pool, not a fold:
+        # out of `sizes`, but still in `total`, because it does train.
+        sizes = (
+            df.filter(pl.col("fold") >= 0)
+            .group_by("fold")
+            .len()
+            .sort("fold")["len"]
+            .to_list()
+        )
+        if not sizes:
+            continue
+        total = df.height
         min_train = total - max(sizes)
         max_pct = round(100.0 * max(sizes) / total, 1)
         reasons = []
@@ -733,6 +944,87 @@ def _gather(root: Path, pattern: str, stamp: bool) -> List[pl.DataFrame]:
     return frames
 
 
+def _gather_holdout(root: Path) -> List[pl.DataFrame]:
+    """Every holdout_summary.csv, each naming the model it tested.
+
+    Runs from before the summary had a `model` column still say which
+    model it was: the results_summary.csv saved beside it with the
+    retrained model records the class name.
+    """
+    frames: List[pl.DataFrame] = []
+    for path in sorted(root.glob("holdout_*/**/holdout_summary.csv")):
+        frame = _read_csv_or_none(path)
+        if frame is None:
+            continue
+        if "holdout_grouping" not in frame.columns:
+            frame = frame.with_columns(
+                pl.lit(_grouping_from_path(path)).alias("holdout_grouping")
+            ).select(["holdout_grouping", *frame.columns])
+        if "model" not in frame.columns:
+            saved = _read_csv_or_none(path.with_name("results_summary.csv"))
+            models = (
+                saved["model"].drop_nulls().unique().to_list()
+                if saved is not None and "model" in saved.columns
+                else []
+            )
+            model = models[0] if len(models) == 1 else None
+            frame = frame.with_columns(
+                pl.lit(model, dtype=pl.Utf8).alias("model")
+            )
+        frames.append(frame)
+    return frames
+
+
+def plot_sweep(sweep_tsv: Path, out_dir: Path) -> None:
+    """Draw the sweep comparison figures: top 3 per panel, then every run.
+
+    The CV metric bars always; the train vs CV (vs holdout) figure when
+    final_fit_all.tsv or holdout_sweep_summary.tsv sits beside the
+    sweep table. Separate processes, as the scripts are command-line
+    tools. A figure is a convenience, so a failure is logged and
+    collate carries on.
+    """
+    import subprocess
+
+    here = Path(__file__).resolve().parent
+    base = sweep_tsv.parent
+    fit_vs_cv = (base / "holdout_sweep_summary.tsv").is_file() or (
+        base / "final_fit_all.tsv"
+    ).is_file()
+    for top in ("3", "all"):
+        jobs = [
+            (
+                "Sweep",
+                [
+                    str(here / "plot_cv_sweep_top3.py"),
+                    "-i",
+                    str(sweep_tsv),
+                    "--metric",
+                    "all",
+                ],
+            )
+        ]
+        if fit_vs_cv:
+            jobs.append(
+                (
+                    "Fit-vs-CV",
+                    [str(here / "plot_fit_vs_cv.py"), "-d", str(base)],
+                )
+            )
+        for name, cmd in jobs:
+            cmd = [sys.executable, *cmd, "-o", str(out_dir), "--top", top]
+            done = subprocess.run(cmd, capture_output=True, text=True)
+            if done.returncode != 0:
+                LOGGER.warning(
+                    "%s figure (--top %s) failed: %s",
+                    name,
+                    top,
+                    (done.stderr or done.stdout).strip()[-2000:],
+                )
+            else:
+                LOGGER.info("%s figures (--top %s) in %s", name, top, out_dir)
+
+
 def step_collate(args: argparse.Namespace) -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -756,8 +1048,18 @@ def step_collate(args: argparse.Namespace) -> None:
         )
 
     best_frames = _gather(out, "holdout_*/**/best_models_summary.csv", True)
-    all_frames = _gather(out, "holdout_*/**/results_summary.csv", True)
-    holdout_frames = _gather(out, "holdout_*/**/holdout_summary.csv", False)
+    # cv_results/ only: best_models/<label>/<scheme>/ repeats the winning
+    # row and holdout/ holds final-test rows under the same file name, so
+    # `**/results_summary.csv` listed every winner twice. An older tree
+    # without cv_results/ keeps the old pattern.
+    all_frames = _gather(
+        out, "holdout_*/**/cv_results/results_summary.csv", True
+    ) or _gather(out, "holdout_*/**/results_summary.csv", True)
+    holdout_frames = _gather_holdout(out)
+    # final_fit.enabled: the CV winner refit on the whole training pool.
+    full_fit_frames = _gather(
+        out, "holdout_*/**/final_fit/full_fit_metrics.csv", True
+    )
 
     if statuses:
         pl.DataFrame(statuses).write_csv(
@@ -766,9 +1068,17 @@ def step_collate(args: argparse.Namespace) -> None:
     # Not written out: it is cv_sweep_all.tsv reduced to the top row per
     # grouping/label/scheme, and cv_sweep_headline.tsv is built from it.
     best_df = _concat_sorted(best_frames, "avg_validation_r2")
-    _concat_sorted(all_frames, "avg_validation_r2", out / "cv_sweep_all.tsv")
+    all_df = _concat_sorted(
+        all_frames, "avg_validation_r2", out / "cv_sweep_all.tsv"
+    )
     if holdout_frames:
         _concat_sorted(holdout_frames, "r2", out / "holdout_sweep_summary.tsv")
+    if full_fit_frames:
+        _concat_sorted(
+            full_fit_frames, "in_sample_r2", out / "final_fit_all.tsv"
+        )
+    if all_df is not None:
+        plot_sweep(out / "cv_sweep_all.tsv", out / "sweep_visualisations")
 
     bad = [s for s in statuses if s.get("status") != "ok"]
     if bad:
