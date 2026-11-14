@@ -2662,9 +2662,10 @@ def main() -> None:
         LOGGER.warning(warning)
     if not args.dry_run:
         missing = missing_inputs(derive_config(template, combos[0], icc_group))
-        if args.base_prepared and not (
-            Path(args.base_prepared) / "manifest.json"
-        ).exists():
+        if (
+            args.base_prepared
+            and not (Path(args.base_prepared) / "manifest.json").exists()
+        ):
             missing.append(f"{args.base_prepared}/manifest.json")
         if missing:
             sys.exit("Input file(s) not found:\n  " + "\n  ".join(missing))

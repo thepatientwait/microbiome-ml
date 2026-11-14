@@ -41,11 +41,11 @@ from sweep_tokens import (  # noqa: E402,F401
 from microbiome_ml.train.cv import CrossValidator  # noqa: E402
 from microbiome_ml.train.full_fit import write_full_fit_report  # noqa: E402
 from microbiome_ml.train.results import CV_Result  # noqa: E402
+from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
 from microbiome_ml.transforms.labels import (  # noqa: E402
     label_variants,
     split_label_variant,
 )
-from microbiome_ml.train.trainer import ModelTrainer  # noqa: E402
 from microbiome_ml.visualise.visualisations import Visualiser  # noqa: E402
 from microbiome_ml.wrangle import recipe as feature_recipe  # noqa: E402
 from microbiome_ml.wrangle.dataset import (  # noqa: E402
@@ -333,7 +333,9 @@ def step_split(args: argparse.Namespace) -> None:
         if names:
             # One CV job per transform of the label (cv.target_transform),
             # all on this one split: `ph`, `ph@yeo_johnson`, ...
-            for variant in label_variants(label, cv_cfg.get("target_transform")):
+            for variant in label_variants(
+                label, cv_cfg.get("target_transform")
+            ):
                 schemes[variant] = sorted(names)
     if not bool(cv_cfg.get("enabled", True)):
         # Record the schemes even when CV is off: the workflow gates on
