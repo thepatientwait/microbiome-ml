@@ -166,13 +166,98 @@ def test_the_figure_is_drawn(tmp_path, stages):
     assert (out / "top_candidates.png").stat().st_size > 0
 
 
+def _baseline(root: Path) -> Path:
+    """A plain run's base_dir: cv_sweep_all.tsv, no combo column."""
+    root.mkdir(parents=True)
+    cols = [c for c in MODEL_COLS if c != "combo"]
+    rf, xgb = "RandomForestRegressor", "XGBRegressor"
+    rows = [
+        _row(None, "ph", "month", rf, 0.50),  # beats every tuned month score
+        _row(None, "ph", "bioproject", rf, 0.10),
+        _row(None, "ph", "month", xgb, 0.20),
+        _row(None, "ph", "bioproject", xgb, 0.15),
+        _row(None, "ph", "random", rf, 0.90),  # a scheme no sweep scored
+    ]
+    with (root / "cv_sweep_all.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, cols, delimiter="\t", extrasaction="ignore"
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({**row, "feature_set": "tax_genus"})
+    with (root / "holdout_sweep_summary.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            ("holdout_grouping", "label", "scheme", "model", "r2"),
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "holdout_grouping": "bioproject",
+                "label": "ph",
+                "scheme": "month",
+                "model": rf,
+                "r2": 0.35,
+            }
+        )
+    return root
+
+
+def test_the_baseline_is_a_control_beside_the_picks(tmp_path, stages):
+    out = tmp_path / "tally"
+    inputs = {"baseline": _baseline(tmp_path / "baseline"), **stages}
+    ts.tally(inputs, out, top=3, plot=False)
+
+    candidates = _read(out / "candidates.tsv")
+    control = [r for r in candidates if r["stage"] == "baseline"]
+    # only the schemes the sweeps scored; named after its rank
+    assert {r["scheme"] for r in control} == {"month", "bioproject"}
+    assert {r["combo"] for r in control} == {"baseline_genus"}
+    # ranked with the rest: it leads month
+    month = [r for r in candidates if r["scheme"] == "month"]
+    assert month[0]["stage"] == "baseline" and month[0]["holdout_r2"] == "0.35"
+
+    # never picked; its best model (rf: mean 0.30 vs xgb 0.175) sits beside
+    picks = _read(out / "picks.tsv")
+    assert {r["stage"] for r in picks} == {"hypertune"}
+    month_pick = next(r for r in picks if r["scheme"] == "month")
+    assert month_pick["baseline_model"] == "rf"
+    assert float(month_pick["baseline_mean_pooled_r2"]) == pytest.approx(0.30)
+    assert month_pick["baseline_pooled_r2"] == "0.5"
+    assert month_pick["baseline_holdout_r2"] == "0.35"
+
+    text = (out / "SUMMARY.txt").read_text()
+    assert (
+        "vs baseline baseline_genus | model rf" in text and "(+0.045)" in text
+    )
+
+
+def test_the_figure_keeps_a_row_for_the_baseline(tmp_path, stages):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "tally"
+    inputs = {"baseline": _baseline(tmp_path / "baseline"), **stages}
+    ts.tally(inputs, out, top=2, plot=True)
+    assert (out / "top_candidates.png").stat().st_size > 0
+
+
 def test_labels_and_params_parse():
     assert ts.split_label("geo_ph@yeo_johnson") == ("geo_ph", "yeo_johnson")
     assert ts.split_label("geo_ph") == ("geo_ph", "none")
     assert ts.params_text("{}") == "defaults"
     assert ts.params_text('{"b": 1, "a": 0.5}') == "a=0.5, b=1"
     assert ts.n_filters("clr_prev0p1_icc0p75_var1e-06") == 2
-    assert ts.fold_sd("[0.1, 0.3, null, NaN]") == pytest.approx(
-        0.1414, abs=1e-4
-    )
-    assert ts.fold_sd("[0.2]") is None and ts.fold_sd("") is None
+    # worst to best fold, skipping missing folds
+    folds = "[-2.056, -2.718, -0.264, -0.878, -8.051, null, NaN]"
+    assert ts.fold_range(folds) == (-8.051, -0.264)
+    assert ts.fold_range("[0.2]") == (0.2, 0.2)
+    assert ts.fold_range("") == (None, None)
+
+
+def test_the_figure_can_leave_the_holdout_out(tmp_path, stages):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "tally"
+    ts.tally(stages, out, plot=True, holdout=False)
+    assert (out / "top_candidates.png").stat().st_size > 0
+    # the tables keep it
+    assert "0.31" in (out / "candidates.tsv").read_text()
