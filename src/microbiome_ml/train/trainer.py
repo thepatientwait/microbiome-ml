@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import polars as pl
+import scipy.sparse as sp
 from scipy.stats import pearsonr
 from sklearn.base import clone
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -274,8 +275,10 @@ class ModelTrainer:
         X_train, y_train, feature_cols = self._assemble_split(
             feature_df, train_df, label_name
         )
+        # The training layout, not "auto" again: auto decides per matrix,
+        # and an SVR fitted dense refuses a sparse test matrix.
         X_test, y_test, _ = self._assemble_split(
-            feature_df, test_df, label_name
+            feature_df, test_df, label_name, sparse=sp.issparse(X_train)
         )
 
         estimator = self._clone_estimator(best_result)
@@ -421,12 +424,17 @@ class ModelTrainer:
         return features
 
     def _assemble_split(
-        self, features: pl.LazyFrame, split_df: pl.DataFrame, label: str
+        self,
+        features: pl.LazyFrame,
+        split_df: pl.DataFrame,
+        label: str,
+        sparse: Union[str, bool, None] = None,
     ) -> Tuple[Matrix, np.ndarray, List[str]]:
         """Produce the feature matrix and target array for a specific split.
 
         Rows in the split's order, labelled samples only; a sample with no
         feature row gets `fillna`, as the left join this replaces did.
+        *sparse* overrides the trainer's setting for this matrix.
         """
         if isinstance(features, pl.DataFrame):
             features = features.lazy()
@@ -449,7 +457,7 @@ class ModelTrainer:
             keys["sample"].to_list(),
             feature_cols,
             fillna=self.fillna,
-            sparse=self.sparse,
+            sparse=self.sparse if sparse is None else sparse,
         )
         y = np.asarray(keys[label].to_numpy(), dtype=float)
         return X, y, feature_cols

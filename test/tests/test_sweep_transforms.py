@@ -97,6 +97,192 @@ def test_an_unknown_transform_is_refused(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A list instead of a grid: sweep.combos and sweep.best_of
+# ---------------------------------------------------------------------------
+def test_listed_combos_run_only_themselves_with_their_own_labels(tmp_path):
+    sweep = {
+        "combos": [
+            # "1e-06" as PyYAML reads it without a dot: a string
+            {
+                "transform": "clr",
+                "min_prevalence": 0.1,
+                "variance_threshold": "1e-06",
+                "labels": ["ph", "geo_ph"],
+            },
+            {"transform": "relabund", "min_prevalence": 0.2},
+        ]
+    }
+    combos = sw.listed_combos(sweep, TEMPLATE, False, tmp_path)
+    assert [c.id for c in combos] == [
+        "clr_prev0p1_var1e-06",
+        "relabund_prev0p2",
+    ]
+    first = sw.derive_config(TEMPLATE, combos[0], "bioproject")
+    assert first["cv"]["label"] == ["ph", "geo_ph"]
+    assert first["features"]["variance_threshold"] == 1e-06
+    # no labels: the template's cv.label (none here) is left alone
+    assert (
+        "label"
+        not in sw.derive_config(TEMPLATE, combos[1], "bioproject")["cv"]
+    )
+    assert sw.listed_combos({}, TEMPLATE, False, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "sweep,message",
+    [
+        ({"combos": [{"min_prevalence": 0.1}]}, "needs `transform`"),
+        ({"combos": [{"transform": "clr", "prev": 0.1}]}, "unknown"),
+        ({"combos": [{"transform": "clr", "max_icc": 75}]}, "fractions"),
+        (
+            {"combos": [{"transform": "clr"}, {"transform": "clr"}]},
+            "more than once",
+        ),
+        (
+            {"combos": [{"transform": "clr"}], "transforms": ["clr"]},
+            "replace the grid",
+        ),
+        ({"combos": []}, "no combinations"),
+    ],
+)
+def test_listed_combos_refuse_what_they_cannot_run(tmp_path, sweep, message):
+    with pytest.raises(ValueError, match=message):
+        sw.listed_combos(sweep, TEMPLATE, False, tmp_path)
+
+
+def _headline_row(combo, label, pooled, icc=None, var=None, prev=0.1):
+    transform = combo.split("_")[0]
+    return {
+        "combo": combo,
+        "transform": transform,
+        "min_prevalence": prev,
+        "max_icc": icc,
+        "variance_threshold": var,
+        "shadow": False,
+        "label": label,
+        "best_grouped_pooled_r2": pooled,
+        "best_grouped_r2": pooled,
+    }
+
+
+def test_best_of_takes_each_labels_top_two_counting_ties_once(tmp_path):
+    out = tmp_path / "feature_sweep"
+    (out / "summary").mkdir(parents=True)
+    rows = [
+        # ph: the ICC cut removed nothing (same score): one setting, the
+        # plain one, then the next score down
+        _headline_row("clr_prev0p1_icc0p75", "ph", 0.40, icc=0.75),
+        _headline_row("clr_prev0p1", "ph", 0.40),
+        _headline_row("clr_prev0p1_var1e-06", "ph", 0.38, var=1e-06),
+        _headline_row("relabund_prev0p1", "ph", 0.30),
+        # geo_ph shares the winner, so that combo trains both labels
+        _headline_row("clr_prev0p1", "geo_ph", 0.50),
+        _headline_row("relabund_prev0p1", "geo_ph", 0.45),
+        _headline_row("clr_prev0p1_var1e-06", "geo_ph", 0.20, var=1e-06),
+        # not asked for
+        _headline_row("clr_prev0p1", "oxy", 0.90),
+    ]
+    pl.DataFrame(rows).write_csv(
+        out / "summary" / "headline.tsv", separator="\t"
+    )
+    template = {
+        **TEMPLATE,
+        "cv": {**TEMPLATE["cv"], "label": ["ph", "geo_ph"]},
+    }
+    combos = sw.listed_combos(
+        {"best_of": {"sweep": str(out), "top": 2}}, template, False, tmp_path
+    )
+    assert {c.id: c.labels for c in combos} == {
+        "clr_prev0p1": ["ph", "geo_ph"],
+        "clr_prev0p1_var1e-06": ["ph"],
+        "relabund_prev0p1": ["geo_ph"],
+    }
+    assert all(c.dir.parent == tmp_path for c in combos)
+
+
+def test_combos_beside_best_of_add_a_control_and_merge_a_repeat(tmp_path):
+    out = tmp_path / "feature_sweep"
+    (out / "summary").mkdir(parents=True)
+    rows = [
+        _headline_row("clr_prev0p1", "ph", 0.40),
+        _headline_row("relabund_prev0p1", "ph", 0.30),
+        _headline_row("clr_prev0p1", "geo_ph", 0.50),
+        _headline_row("relabund_prev0p1", "geo_ph", 0.45),
+    ]
+    pl.DataFrame(rows).write_csv(
+        out / "summary" / "headline.tsv", separator="\t"
+    )
+    template = {
+        **TEMPLATE,
+        "cv": {**TEMPLATE["cv"], "label": ["ph", "geo_ph"]},
+    }
+    sweep = {
+        "best_of": {"sweep": str(out), "top": 1},
+        "combos": [
+            # the raw-feature control: no labels, so the template's
+            {"transform": "relabund", "min_prevalence": 0},
+            # also a pick (for both labels): one run, still both labels
+            {"transform": "clr", "min_prevalence": 0.1, "labels": ["ph"]},
+        ],
+    }
+    combos = sw.listed_combos(sweep, template, False, tmp_path)
+    assert {c.id: c.labels for c in combos} == {
+        "clr_prev0p1": ["ph", "geo_ph"],
+        "relabund_prev0": None,
+    }
+    control = sw.derive_config(template, combos[1], "bioproject")
+    assert control["cv"]["label"] == ["ph", "geo_ph"]
+    assert control["features"]["min_prevalence"] == 0
+    assert control["features"]["icc"]["max_icc"] is None
+
+
+def test_the_report_names_each_winners_hyperparameters():
+    models = pl.DataFrame(
+        {
+            "combo": ["clr", "clr"],
+            "holdout_grouping": ["bioproject", "bioproject"],
+            "label": ["ph", "ph"],
+            "scheme": ["month", "month"],
+            "feature_set": ["tax_order_clr_bio", "tax_order_clr_bio"],
+            "model": ["XGBRegressor", "ScaledSVR"],
+            "best_params": ['{"max_depth": 6, "learning_rate": 0.03}', "{}"],
+        }
+    )
+    lookup = sw.params_lookup(models)
+    headline_row = {
+        "combo": "clr",
+        "holdout_grouping": "bioproject",
+        "label": "ph",
+        "best_grouped_scheme": "month",
+        "best_grouped_feature_set": "tax_order_clr_bio",
+        "best_grouped_model": "XGBRegressor",
+    }
+    assert sw._params_line(lookup, headline_row, "best_grouped_") == (
+        "      XGBRegressor @ month: learning_rate=0.03, max_depth=6"
+    )
+    holdout_row = {
+        "combo": "clr",
+        "holdout_grouping": "bioproject",
+        "label": "ph",
+        "scheme": "month",
+        "feature_set": "tax_order_clr_bio",
+        "model": "ScaledSVR",
+    }
+    assert sw._params_line(lookup, holdout_row).endswith("library defaults")
+    assert sw._params_line(lookup, {**holdout_row, "label": "oxy"}) is None
+
+
+def test_best_of_needs_the_finished_sweep(tmp_path):
+    with pytest.raises(ValueError, match="run that sweep"):
+        sw.listed_combos(
+            {"best_of": {"sweep": str(tmp_path / "nope")}},
+            TEMPLATE,
+            False,
+            tmp_path,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Feature set names
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
