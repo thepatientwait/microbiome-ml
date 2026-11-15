@@ -49,7 +49,9 @@ def test_a_dense_table_stays_dense():
 def test_sparse_can_be_forced_either_way():
     frame, values, samples = _table(density=0.9)
     cols = [c for c in frame.columns if c != "sample"]
-    assert sp.issparse(feature_matrix(frame.lazy(), samples, cols, sparse=True))
+    assert sp.issparse(
+        feature_matrix(frame.lazy(), samples, cols, sparse=True)
+    )
     frame, values, samples = _table(density=0.01)
     dense = feature_matrix(frame.lazy(), samples, cols, sparse=False)
     assert isinstance(dense, np.ndarray)
@@ -212,5 +214,50 @@ def test_the_holdout_trainer_reads_a_sparse_matrix(tmp_path):
         trainer._materialize_feature_set("feat"), labels.head(30), "target"
     )
     assert sp.issparse(X) and X.shape == (30, 30) and len(cols) == 30
+    evaluation = trainer.train_and_evaluate()
+    assert evaluation.metrics["n_test"] == 10
+
+
+def test_the_holdout_test_rows_take_the_training_layout(tmp_path):
+    """Dense training rows, sparse test rows: an SVR fitted dense refuses a
+    sparse matrix, so "auto" must not decide the test matrix on its own."""
+    from sklearn.svm import SVR
+
+    from microbiome_ml.train.results import CV_Result
+
+    dense, _, _ = _table(n=30, p=20, density=0.9, seed=1)
+    sparse_rows, _, _ = _table(n=10, p=20, density=0.05, seed=2)
+    sparse_rows = sparse_rows.with_columns(
+        pl.Series("sample", [f"t{i}" for i in range(10)])
+    )
+    frame = pl.concat([dense, sparse_rows])
+    samples = frame["sample"].to_list()
+    labels = pl.DataFrame(
+        {"sample": samples, "target": [float(i) for i in range(40)]}
+    )
+
+    class _DS:
+        feature_sets = {"feat": _FeatureSet(frame)}
+
+        def get_train_samples(self, label, fold=None, metadata=True):
+            return labels.head(30)
+
+        def get_test_samples(self, label, fold=None, metadata=True):
+            return labels.tail(10)
+
+    result = CV_Result(
+        feature_set="feat",
+        label="target",
+        scheme="random",
+        trained_model=SVR(kernel="linear"),
+    )
+    trainer = ModelTrainer(_DS(), result, tmp_path / "m.pkl")
+    features = trainer._materialize_feature_set("feat")
+    # each alone, auto picks a different layout
+    train_X, _, _ = trainer._assemble_split(
+        features, labels.head(30), "target"
+    )
+    test_X, _, _ = trainer._assemble_split(features, labels.tail(10), "target")
+    assert not sp.issparse(train_X) and sp.issparse(test_X)
     evaluation = trainer.train_and_evaluate()
     assert evaluation.metrics["n_test"] == 10

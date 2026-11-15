@@ -32,6 +32,14 @@ So the grid is
 `len(transforms) x max(1, len(min_prevalence)) x (1 + len(icc_max))
 x (1 + len(variance_threshold))`.
 
+A LIST INSTEAD OF A GRID: `sweep.combos` names the combinations (each a
+transform with optional min_prevalence, max_icc, variance_threshold and
+`labels`, its own cv.label). `sweep.best_of: {sweep: DIR, top: 2}` builds
+that list from a finished sweep: each label's two best settings in
+DIR/summary/headline.tsv, ties counted once as the simplest recipe, so a
+label sweep (cv.target_transform) runs on each label's winners only.
+Given both, the combos run beside the picks (e.g. a raw-feature control).
+
 ONE PREPARE FOR THE WHOLE GRID: with `--base-prepared DIR` (or
 `sweep.base_prepared`), no combination runs `prepare`. DIR is a dataset
 that one prepare built with the rank's relative abundance and nothing
@@ -152,6 +160,7 @@ from typing import (
     List,
     Optional,
     Set,
+    Tuple,
 )
 
 import polars as pl
@@ -264,12 +273,16 @@ class Combo:
         out_root: Path,
         min_prevalence: Optional[float] = None,
         variance_threshold: Optional[float] = None,
+        labels: Optional[List[str]] = None,
     ) -> None:
         self.transform = canonical_transform(transform)
         self.max_icc = max_icc
         self.shadow = shadow
         self.min_prevalence = min_prevalence
         self.variance_threshold = variance_threshold
+        # The labels this combo trains (cv.label), when not the template's.
+        # Not part of the id: the folder is the feature setting.
+        self.labels = list(labels) if labels else None
         parts = [self.transform]
         if min_prevalence is not None:
             # 0.01 -> prev0p01, for the same reason as the ICC part.
@@ -332,6 +345,208 @@ def build_grid(
     # `pa` and `presence`, or a value given twice, are one id and so one
     # directory. Two runs there would overwrite each other.
     return list({combo.id: combo for combo in combos}.values())
+
+
+# The grid's axes in the sweep section; sweep.combos / sweep.best_of
+# replace all of them.
+GRID_KEYS = ("transforms", "min_prevalence", "icc_max", "variance_threshold")
+COMBO_FIELDS = (
+    "transform",
+    "min_prevalence",
+    "max_icc",
+    "variance_threshold",
+    "labels",
+)
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    # float(), not yaml: PyYAML reads `1e-06` (no dot) as a string.
+    if value is None or value == "":
+        return None
+    number = float(value)
+    return None if number != number else number
+
+
+def explicit_combos(
+    entries: List[Dict[str, Any]], shadow: bool, out_root: Path
+) -> List[Combo]:
+    """`sweep.combos`: the combinations to run, in place of a grid.
+
+    Each entry is a transform with optional min_prevalence, max_icc,
+    variance_threshold, and `labels` (cv.label for that combo only).
+    """
+    combos: List[Combo] = []
+    for entry in entries:
+        unknown = sorted(set(entry) - set(COMBO_FIELDS))
+        if unknown or "transform" not in entry:
+            raise ValueError(
+                f"sweep.combos entry {entry}: needs `transform`, may have "
+                f"{', '.join(COMBO_FIELDS[1:])}; unknown: {unknown}"
+            )
+        fractions = [entry.get("min_prevalence"), entry.get("max_icc")]
+        variance = _optional_float(entry.get("variance_threshold"))
+        if any(not 0 <= float(v) <= 1 for v in fractions if v is not None) or (
+            variance is not None and variance < 0
+        ):
+            raise ValueError(
+                f"sweep.combos entry {entry}: min_prevalence and max_icc "
+                "are fractions from 0 to 1, variance_threshold >= 0"
+            )
+        combos.append(
+            Combo(
+                str(entry["transform"]),
+                _optional_float(entry.get("max_icc")),
+                shadow,
+                out_root,
+                _optional_float(entry.get("min_prevalence")),
+                variance,
+                labels=_as_list(entry.get("labels")),
+            )
+        )
+    ids = [combo.id for combo in combos]
+    twice = sorted({i for i in ids if ids.count(i) > 1})
+    if twice:
+        raise ValueError(
+            f"sweep.combos lists {twice} more than once; give one entry "
+            "all of its labels"
+        )
+    return combos
+
+
+def _n_filters(row: Dict[str, Any]) -> int:
+    return sum(
+        _optional_float(row.get(k)) is not None
+        for k in ("max_icc", "variance_threshold")
+    )
+
+
+def best_combos(
+    headline: pl.DataFrame,
+    top: int,
+    shadow: bool,
+    out_root: Path,
+    labels: Optional[List[str]] = None,
+) -> List[Combo]:
+    """`sweep.best_of`: each label's *top* settings from a finished sweep.
+
+    *headline* is that sweep's summary/headline.tsv, scored as the summary
+    ranks it (pooled R2 first). Settings that score exactly the same for a
+    label built the same features -- an ICC or variance cut that removed
+    nothing -- so they count once, as the one with the fewest filters. A
+    setting picked by several labels is one combo training all of them.
+    """
+    rows: Dict[str, List[Dict[str, Any]]] = {}
+    for row in headline.iter_rows(named=True):
+        label = str(row.get("label"))
+        if labels is not None and label not in labels:
+            continue
+        score = next(
+            (
+                _optional_float(row.get(k))
+                for k in RANK_ON
+                if _optional_float(row.get(k)) is not None
+            ),
+            None,
+        )
+        if score is not None:
+            rows.setdefault(label, []).append({**row, "_score": score})
+    for label in labels or []:
+        if label not in rows:
+            LOGGER.warning("best_of: no score for %s in the summary", label)
+
+    picked: Dict[str, Dict[str, Any]] = {}
+    for label, scored in rows.items():
+        scored.sort(
+            key=lambda r: (
+                -round(r["_score"], 9),
+                _n_filters(r),
+                _optional_float(r.get("variance_threshold")) or 0.0,
+                str(r.get("combo")),
+            )
+        )
+        seen: Set[float] = set()
+        for row in scored:
+            if len(seen) == top:
+                break
+            if round(row["_score"], 9) in seen:
+                continue
+            seen.add(round(row["_score"], 9))
+            entry = picked.setdefault(
+                str(row["combo"]),
+                {**{k: row.get(k) for k in COMBO_FIELDS[:-1]}, "labels": []},
+            )
+            entry["labels"].append(label)
+            LOGGER.info(
+                "best_of: %s #%d is %s (%.4f)",
+                label,
+                len(seen),
+                row["combo"],
+                row["_score"],
+            )
+    combos = explicit_combos(list(picked.values()), shadow, out_root)
+    for combo, combo_id in zip(combos, picked):
+        if combo.id != combo_id:
+            raise ValueError(
+                f"best_of: {combo_id} rebuilt as {combo.id}; the summary's "
+                "settings columns do not match its combo names"
+            )
+    return combos
+
+
+def listed_combos(
+    sweep: Dict[str, Any],
+    template: Dict[str, Any],
+    shadow: bool,
+    out_root: Path,
+) -> Optional[List[Combo]]:
+    """`sweep.combos` and/or `sweep.best_of` in place of the grid, else None.
+
+    best_of: {sweep: <a finished sweep's out>, top: 2, labels: [...]}
+    reads <sweep>/summary/headline.tsv; labels default to the template's
+    cv.label (else every label in the summary). With both, the combos run
+    as well as best_of's picks, e.g. a fixed control. A combo in both is
+    one run with the labels of both (no labels = every label).
+    """
+    entries, best = sweep.get("combos"), sweep.get("best_of")
+    if entries is None and best is None:
+        return None
+    clash = [k for k in GRID_KEYS if sweep.get(k) is not None]
+    if clash:
+        raise ValueError(
+            "sweep.combos / sweep.best_of replace the grid; remove sweep."
+            + ", sweep.".join(clash)
+        )
+    combos: List[Combo] = []
+    if best is not None:
+        path = Path(best["sweep"]) / "summary" / "headline.tsv"
+        headline = _read_tsv(path)
+        if headline is None:
+            raise ValueError(
+                f"best_of: no {path}; run that sweep (or its "
+                "--summary-only) first"
+            )
+        wanted = best.get("labels") or (template.get("cv") or {}).get("label")
+        combos += best_combos(
+            headline,
+            int(best.get("top", 2)),
+            shadow,
+            out_root,
+            None if wanted is None else _as_list(wanted),
+        )
+    if entries is not None:
+        combos += explicit_combos(list(entries), shadow, out_root)
+    merged: Dict[str, Combo] = {}
+    for combo in combos:
+        kept = merged.setdefault(combo.id, combo)
+        if kept is not combo:
+            kept.labels = (
+                list(dict.fromkeys(kept.labels + combo.labels))
+                if kept.labels and combo.labels
+                else None
+            )
+    if not merged:
+        raise ValueError("sweep.combos / sweep.best_of gave no combinations")
+    return list(merged.values())
 
 
 def discover_combos(out_root: Path) -> List[Combo]:
@@ -555,6 +770,8 @@ def derive_config(
     cv["feature_set"] = derive_feature_sets(
         features, combo, cv.get("feature_set")
     )
+    if combo.labels:
+        cv["label"] = list(combo.labels)
     return cfg
 
 
@@ -959,13 +1176,65 @@ def _fmt(value: Any, spec: str = ".3f") -> str:
     return format(number, spec)
 
 
+PARAM_KEYS = ("combo", "holdout_grouping", "label", "scheme", "feature_set")
+
+
+def params_text(raw: Any) -> str:
+    """`best_params` (JSON in all_models.tsv) as `k=v, ...`; "" for none."""
+    if raw is None or raw == "":
+        return ""
+    try:
+        params = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return str(raw)
+    return ", ".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+
+def params_lookup(
+    all_models: Optional[pl.DataFrame],
+) -> Dict[Tuple[str, ...], str]:
+    """(combo, grouping, label, scheme, feature set, model) -> its params."""
+    need = (*PARAM_KEYS, "model", "best_params")
+    if all_models is None or any(c not in all_models.columns for c in need):
+        return {}
+    return {
+        tuple(str(row[k]) for k in (*PARAM_KEYS, "model")): params_text(
+            row["best_params"]
+        )
+        for row in all_models.iter_rows(named=True)
+    }
+
+
+def _params_line(
+    lookup: Dict[Tuple[str, ...], str], row: Dict[str, Any], prefix: str = ""
+) -> Optional[str]:
+    """`model @ scheme: params` under a ranked row, from the lookup."""
+    names = ("scheme", "feature_set", "model")
+    picked = {k: row.get(prefix + k if k in names else k) for k in PARAM_KEYS}
+    picked["model"] = row.get(prefix + "model")
+    key = tuple(str(picked[k]) for k in (*PARAM_KEYS, "model"))
+    if key not in lookup:
+        return None
+    return "      {} @ {}: {}".format(
+        picked["model"], picked["scheme"], lookup[key] or "library defaults"
+    )
+
+
 def report_text(
     headline: Optional[pl.DataFrame],
     status: pl.DataFrame,
     combos: List[Combo],
     holdout: Optional[pl.DataFrame] = None,
+    all_models: Optional[pl.DataFrame] = None,
 ) -> str:
-    """The one file to read: which transform won, per label."""
+    """The one file to read: which transform won, per label.
+
+    With *all_models* from a grid-searched sweep (cv.mode: run_grid), each
+    ranked row is followed by the winning model's hyperparameters.
+    """
+    lookup = params_lookup(all_models)
+    # Default fits all carry `{}`: the lines would only repeat that.
+    tuned = any(lookup.values())
     lines: List[str] = []
     add = lines.append
     add("=" * 78)
@@ -1086,6 +1355,11 @@ def report_text(
                     str(row.get("best_grouped_model") or "-"),
                 )
             )
+            line = (
+                _params_line(lookup, row, "best_grouped_") if tuned else None
+            )
+            if line:
+                add(line)
         add("")
 
     # Noted, not alarmed at. A `_shad` set holds every real column PLUS
@@ -1150,10 +1424,14 @@ def report_text(
             "where the two disagree, that one is the result."
         )
     add("=" * 78)
-    return _holdout_block(lines, holdout)
+    return _holdout_block(lines, holdout, lookup if tuned else {})
 
 
-def _holdout_block(lines: List[str], holdout: Optional[pl.DataFrame]) -> str:
+def _holdout_block(
+    lines: List[str],
+    holdout: Optional[pl.DataFrame],
+    lookup: Optional[Dict[Tuple[str, ...], str]] = None,
+) -> str:
     """Append the final-test ranking, when the holdout ran.
 
     Printed after the CV blocks and the caveats, because it is the
@@ -1199,6 +1477,9 @@ def _holdout_block(lines: List[str], holdout: Optional[pl.DataFrame]) -> str:
                     str(row.get("feature_set") or "-"),
                 )
             )
+            line = _params_line(lookup, row) if lookup else None
+            if line:
+                add(line)
         add("")
     add(
         "A combination missing here ran CV but not the holdout, or "
@@ -1259,7 +1540,8 @@ def summarise(combos: List[Combo], out_root: Path) -> Path:
 
     report = summary_dir / "SUMMARY.txt"
     report.write_text(
-        report_text(headline, status, combos, holdout), encoding="utf-8"
+        report_text(headline, status, combos, holdout, all_models),
+        encoding="utf-8",
     )
     LOGGER.info("Wrote %s", report)
     return report
@@ -2636,15 +2918,29 @@ def main() -> None:
 
     icc_group = args.icc_group
     out_root = args.out.resolve()
-    combos = build_grid(
-        list(args.transform),
-        list(args.icc_max),
-        not args.no_shadow,
-        out_root,
-        list(args.min_prevalence),
-        list(args.variance_threshold),
-    )
+    try:
+        listed = listed_combos(sweep, template, not args.no_shadow, out_root)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if listed is not None:
+        combos = listed
+        if args.base_prepared is None and any(
+            c.variance_threshold is not None for c in combos
+        ):
+            parser.error("a variance_threshold needs sweep.base_prepared")
+    else:
+        combos = build_grid(
+            list(args.transform),
+            list(args.icc_max),
+            not args.no_shadow,
+            out_root,
+            list(args.min_prevalence),
+            list(args.variance_threshold),
+        )
     LOGGER.info("%d combination(s): %s", len(combos), [c.id for c in combos])
+    for combo in combos:
+        if combo.labels:
+            LOGGER.info("  %s trains %s", combo.id, combo.labels)
 
     if args.summary_only:
         on_disk = discover_combos(out_root)
