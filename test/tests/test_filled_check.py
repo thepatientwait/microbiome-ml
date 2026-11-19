@@ -2,8 +2,11 @@
 
 import polars as pl
 
-from microbiome_ml.utils.taxonomy import TaxonomicRanks
-from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+from microbiome_ml.wrangle.profiles import (
+    FILLED,
+    UNFILLED,
+    TaxonomicProfiles,
+)
 
 
 def _profiles(rows):
@@ -33,7 +36,8 @@ def test_filled_check_tolerates_rounded_abundances():
         f"X/X{i}/o/f/g/s{i}": v
         for i, v in enumerate([0.1234, 0.2345, 0.3456, 0.1111], 1)
     }
-    assert _profiles(_filled_rows(leaves, decimals=3))._is_filled()
+    profiles = _profiles(_filled_rows(leaves, decimals=3))
+    assert profiles._detect_layout() == FILLED
 
 
 def test_filled_check_rejects_parents_smaller_than_their_children():
@@ -45,6 +49,4 @@ def test_filled_check_rejects_parents_smaller_than_their_children():
         ("S1", "d__A;p__X;c__X1", 0.4),
         ("S1", "d__A;p__X;c__X2", 0.3),
     ]
-    assert not _profiles(rows)._is_filled_for_rank(
-        TaxonomicRanks.PHYLUM, TaxonomicRanks.CLASS
-    )
+    assert _profiles(rows)._detect_layout() == UNFILLED

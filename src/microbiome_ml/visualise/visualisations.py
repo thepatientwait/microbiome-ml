@@ -83,6 +83,40 @@ _CATEGORICAL_HUES = (
 )
 _OTHER_HUE = "#bdbdbd"  # lighter than tab10 grey, so the two never merge
 
+# Holdout map: drawn in this order. Blue and orange for the two sets, grey
+# for the buffer (in neither); buffer samples sit right beside test ones,
+# so the buffer goes last and part transparent rather than under test.
+_MAP_SIDES = ("train", "test", "buffer")
+_MAP_COLOURS = {"train": "#1f77b4", "test": "#ff7f0e", "buffer": "#6e6e6e"}
+_MAP_ALPHA = {"train": 0.75, "test": 0.85, "buffer": 0.7}
+# Dot area grows with the square root of the samples at a site, on one
+# fixed scale for every map: 1 sample ~3 pt^2, 100 samples ~30 pt^2.
+_MAP_SIZE = 3.0
+_MAP_SIZE_KEY = (1, 10, 100)
+
+
+def _map_dot_size(n_samples: np.ndarray) -> np.ndarray:
+    out: np.ndarray = _MAP_SIZE * np.sqrt(np.asarray(n_samples, dtype=float))
+    return out
+
+
+_MAP_NAMES = {
+    "train": "train",
+    "buffer": "buffer (in neither set)",
+    "test": "test",
+}
+
+
+def _fmt_r2(value: float) -> str:
+    """An R2 a human can read at a glance.
+
+    In range it is a 3-decimal score; a blown-up fold is thousands-
+    separated and loses the decimals nobody reads at that magnitude.
+    """
+    if not np.isfinite(value):
+        return "n/a"
+    return f"{value:,.3f}" if abs(value) < 1000 else f"{value:,.0f}"
+
 
 class Visualiser:
     """Wrap CV exports and holdout diagnostics around a single output root."""
@@ -287,6 +321,8 @@ class Visualiser:
             # If multiple records per key, flatten their folds together in order
             folds: List[float] = []
             avg_r_vals: List[float] = []
+            pooled_vals: List[float] = []
+            sst_vals: List[float] = []
             avg_mse_vals: List[float] = []
             for r in recs:
                 vals = (
@@ -300,6 +336,19 @@ class Visualiser:
                             folds.append(float(v))
                         except Exception:
                             continue
+                ssts = r.get("validation_sst_per_fold") or []
+                if isinstance(ssts, (list, tuple)):
+                    for v in ssts:
+                        try:
+                            sst_vals.append(float(v))
+                        except Exception:
+                            sst_vals.append(float("nan"))
+                pr2 = r.get("pooled_validation_r2")
+                if pr2 is not None:
+                    try:
+                        pooled_vals.append(float(pr2))
+                    except Exception:
+                        pass
                 ar2 = r.get("avg_validation_r2")
                 if ar2 is not None:
                     try:
@@ -322,22 +371,30 @@ class Visualiser:
             if not folds:
                 continue
 
-            # compute avg line value (prefer provided avg if single rec, else mean of avg_r_vals or mean of folds)
-            if len(recs) == 1:
-                avg_line = recs[0].get("avg_validation_r2")
-                try:
-                    avg_line = (
-                        float(avg_line)
-                        if avg_line is not None
-                        else float(sum(folds) / len(folds))
-                    )
-                except Exception:
-                    avg_line = float(sum(folds) / len(folds))
+            # A fold whose held-out group has a constant label has
+            # SST = 0: R2 is undefined and scikit-learn reports 0.0, which
+            # on a bar chart reads as a real, mediocre score. Mark those
+            # and leave them out of the reference line, as pooled R2 does.
+            # Older records carry no SST, so fall back to the rule
+            # CV_Result uses: an exact 0.0 is degenerate.
+            if len(sst_vals) == len(folds):
+                usable = [i for i, t in enumerate(sst_vals) if t > 0]
             else:
-                if avg_r_vals:
-                    avg_line = float(sum(avg_r_vals) / len(avg_r_vals))
-                else:
-                    avg_line = float(sum(folds) / len(folds))
+                usable = [i for i, v in enumerate(folds) if v != 0.0]
+            skipped = set(range(len(folds))) - set(usable)
+
+            # Reference line: pooled R2 -- each fold weighted by the
+            # variance it had to explain -- which is what the sweep ranks
+            # on. The mean is the fallback for a pre-pooled run.
+            line_label = "pooled r²"
+            if pooled_vals:
+                avg_line = float(sum(pooled_vals) / len(pooled_vals))
+            elif avg_r_vals:
+                line_label = "average r²"
+                avg_line = float(sum(avg_r_vals) / len(avg_r_vals))
+            else:
+                line_label = "average r²"
+                avg_line = float(sum(folds) / len(folds))
 
             # compute avg_validation_mse to display under the plot (mean if multiple)
             if len(recs) == 1:
@@ -360,15 +417,72 @@ class Visualiser:
             width = max(4, n * figsize_per_fold)
             fig, ax = plt.subplots(figsize=(width, 4))
             x = list(range(1, n + 1))
-            ax.bar(x, folds, color=bar_color, edgecolor="black")
-            ax.plot(
+
+            # R2 has no lower bound: one leave-one-group-out fold can score
+            # -838,150 and flatten every other bar onto the baseline. Fix the
+            # axis at [-1, 1] -- the range R2 is readable in -- draw anything
+            # below -1 to the floor with a break mark, and print its real
+            # value. The axis is the same height on every plot, so runs can
+            # be compared side by side; with no negative fold the lower half
+            # is dropped and the plot keeps its size.
+            floor = -1.0
+            y_bottom = floor if min(folds) < 0 else 0.0
+            span = 1.0 - y_bottom
+            drawn = [min(max(v, floor), 1.0) for v in folds]
+
+            ax.bar(
                 x,
-                [avg_line] * n,
-                color="k",
-                linestyle="--",
-                marker="o",
-                label=f"average r2 {avg_line:.3f}",
+                drawn,
+                color=[
+                    _OTHER_HUE if i in skipped else bar_color
+                    for i in range(len(folds))
+                ],
+                edgecolor="none",
+                zorder=2,
             )
+            ax.set_ylim(y_bottom, 1.0)
+            ax.set_yticks(
+                [-1.0, -0.5, 0.0, 0.5, 1.0]
+                if y_bottom < 0
+                else [0.0, 0.25, 0.5, 0.75, 1.0]
+            )
+            if y_bottom < 0:
+                ax.axhline(0.0, color="#999999", lw=0.8, zorder=1)
+
+            # Break mark on a clipped bar: two surface-coloured slashes just
+            # above the floor, the usual "this bar runs off the scale" cue.
+            for xi, v in zip(x, folds):
+                if v >= floor:
+                    continue
+                for off in (0.05, 0.09):
+                    ax.plot(
+                        [xi - 0.42, xi + 0.42],
+                        [
+                            y_bottom + span * (off - 0.012),
+                            y_bottom + span * (off + 0.012),
+                        ],
+                        color="white",
+                        lw=2,
+                        solid_capstyle="butt",
+                        zorder=3,
+                    )
+
+            avg_txt = f"{line_label} {_fmt_r2(avg_line)}"
+            if skipped:
+                avg_txt += f" ({len(usable)}/{len(folds)} folds)"
+            if y_bottom <= avg_line <= 1.0:
+                ax.axhline(
+                    avg_line,
+                    color="#222222",
+                    linestyle="--",
+                    lw=1.5,
+                    zorder=4,
+                    label=avg_txt,
+                )
+            else:
+                # Off the axis -- a line at the floor would read as a value.
+                ax.plot([], [], " ", label=f"{avg_txt} (off scale)")
+
             ax.set_xlabel("Fold")
             ax.set_ylabel("Validation R²")
             title = f"{feature_set} — {label} — {scheme} — {model}"
@@ -376,19 +490,46 @@ class Visualiser:
             ax.set_xticks(x)
 
             if show_values:
-                # Always inside the bar at its far end: just below the top
-                # for positive bars, just above the bottom for negative ones.
-                for xi, v in zip(x, folds):
+                for i, (xi, v, dv) in enumerate(zip(x, folds, drawn)):
+                    if i in skipped:
+                        # not "zero variance explained" -- no variance to
+                        # explain, so R2 does not exist for this fold
+                        ax.annotate(
+                            "n/a",
+                            xy=(xi, dv),
+                            xytext=(0, 3 if dv >= 0 else -3),
+                            textcoords="offset points",
+                            ha="center",
+                            va="bottom" if dv >= 0 else "top",
+                            fontsize=8,
+                            color="#555555",
+                            fontstyle="italic",
+                            zorder=5,
+                        )
+                        continue
+                    clipped = v < floor
+                    # White inside the bar only when the bar is tall enough
+                    # to hold the text; otherwise dark ink outside its end,
+                    # else short bars print white on a white background.
+                    inside = clipped or abs(dv) >= 0.18 * span
+                    up = dv >= 0
+                    # Text runs back into the bar when it sits inside the
+                    # far end of an upward bar, or outside the end of a
+                    # downward one -- the same condition either way.
+                    back = inside == up
                     ax.annotate(
-                        f"{v:.3f}",
-                        xy=(xi, v),
-                        xytext=(0, -3 if v >= 0 else 3),
+                        _fmt_r2(v),
+                        # clipped: clear of the break mark, reading upwards
+                        xy=(xi, y_bottom + span * 0.13 if clipped else dv),
+                        xytext=(0, -3 if back else 3),
                         textcoords="offset points",
                         ha="center",
-                        va="top" if v >= 0 else "bottom",
+                        va="top" if back else "bottom",
                         fontsize=8,
-                        color="white",
+                        color="white" if inside else "#222222",
                         fontweight="bold",
+                        rotation=90 if clipped else 0,
+                        zorder=5,
                     )
 
             ax.legend(loc="best")
@@ -939,6 +1080,244 @@ class Visualiser:
         plt.show()
         return stats
 
+    def plot_holdout_map(
+        self,
+        holdout: Union[str, Path, pl.DataFrame],
+        label: Optional[str] = None,
+        cell_km: Optional[float] = None,
+        buffer_km: Optional[float] = None,
+        output: Optional[str] = None,
+        title: Optional[str] = None,
+        gap_km: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Where a holdout's samples are: train, test and buffer on a map.
+
+        One point per site and side (many samples share a site), on
+        longitude/latitude axes. With a spatial holdout's ``spatial_cell``
+        column and *cell_km*, the test cells are shaded too. Coastlines
+        come from cartopy when it is installed and its Natural Earth data
+        loads; otherwise the map is drawn on plain axes with a grid.
+
+        Args:
+            holdout: ``holdout.csv`` path, or the DataFrame itself. Needs
+                ``split``, ``lat`` and ``lon`` (the split step writes the
+                metadata coordinates into it).
+            label: Named in the title (default: the column after split).
+            cell_km: Grid cell size, to shade the test cells.
+            buffer_km: Shown in the title.
+            gap_km: A cluster holdout's gap, shown in the title.
+            output: Optional file stem, as for plot_holdout_distribution.
+            title: Overrides the default title.
+
+        Returns:
+            {label, n_train, n_test, n_buffer, n_sites}
+        """
+        if isinstance(holdout, (str, Path)):
+            holdout = pl.read_csv(holdout, infer_schema_length=10000)
+        missing = [
+            c for c in ("split", "lat", "lon") if c not in holdout.columns
+        ]
+        if missing:
+            raise ValueError(f"holdout has no {missing} column(s) to map")
+        if label is None:
+            rest = [c for c in holdout.columns if c not in ("sample", "split")]
+            label = rest[0] if rest else "holdout"
+
+        points = (
+            holdout.select(
+                pl.col("split").cast(pl.Utf8),
+                pl.col("lat").cast(pl.Float64, strict=False),
+                pl.col("lon").cast(pl.Float64, strict=False),
+            )
+            .drop_nulls()
+            .filter(
+                pl.col("lat").is_between(-90.0, 90.0)
+                & pl.col("lon").is_between(-180.0, 180.0)
+            )
+        )
+        counts = {
+            side: points.filter(pl.col("split") == side).height
+            for side in _MAP_SIDES
+        }
+        # One dot per site and side, sized by how many samples it holds:
+        # a time-series station with 200 samples is one coordinate.
+        sites = (
+            points.with_columns(pl.lit(1).alias("_one"))
+            .group_by(["split", "lat", "lon"])
+            .agg(pl.col("_one").sum().alias("n"))
+            .sort(["split", "lat", "lon"])
+        )
+        test_cells: List[str] = []
+        if cell_km and "spatial_cell" in holdout.columns:
+            test_cells = (
+                holdout.filter(pl.col("split") == "test")
+                .get_column("spatial_cell")
+                .cast(pl.Utf8)
+                .drop_nulls()
+                .unique()
+                .sort()
+                .to_list()
+            )
+
+        head = title or f"Holdout map: {label}"
+        details = []
+        if cell_km:
+            details.append(f"cells {cell_km:.0f} km")
+        if gap_km:
+            details.append(f"clusters, gap {gap_km:.0f} km")
+        if buffer_km is not None:
+            details.append(f"buffer {buffer_km:.0f} km")
+        if details:
+            head += "   ·   " + ", ".join(details)
+
+        # Cartopy first, for coastlines. It fetches Natural Earth on first
+        # use, which fails on a node without internet -- and only when the
+        # figure is drawn, so the save sits inside the attempt.
+        for use_cartopy in (True, False):
+            fig: Optional[plt.Figure] = None
+            try:
+                fig = self._draw_holdout_map(
+                    sites, counts, test_cells, cell_km, head, use_cartopy
+                )
+                if output:
+                    self._save_fig(fig, self._output_stem(output), dpi=300)
+                break
+            except Exception as exc:
+                if fig is not None:
+                    plt.close(fig)
+                if not use_cartopy:
+                    raise
+                logging.info("Holdout map without coastlines (%s)", exc)
+        plt.show()
+        return {
+            "label": label,
+            "n_train": counts["train"],
+            "n_test": counts["test"],
+            "n_buffer": counts["buffer"],
+            "n_sites": points.select("lat", "lon").unique().height,
+        }
+
+    def _output_stem(self, output: str) -> Path:
+        """*output* as a path without extension, under output_dir if bare."""
+        file_path = Path(output)
+        if (
+            file_path.parent in (Path(""), Path("."))
+            and not file_path.is_absolute()
+        ):
+            return self.output_dir / file_path.stem
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        return file_path.with_suffix("")
+
+    def _draw_holdout_map(
+        self,
+        sites: pl.DataFrame,
+        counts: Dict[str, int],
+        test_cells: List[str],
+        cell_km: Optional[float],
+        head: str,
+        use_cartopy: bool,
+    ) -> plt.Figure:
+        from matplotlib.collections import PatchCollection
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch, Rectangle
+
+        from microbiome_ml.wrangle.spatial import cell_bounds
+
+        kw: Dict[str, Any] = {}
+        if use_cartopy:
+            import cartopy.crs as ccrs
+
+            fig = plt.figure(figsize=(13, 7))
+            ax: Any = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+            ax.set_global()
+            # Light coastlines, so the grey buffer dots stand out on them.
+            ax.coastlines(linewidth=0.4, color="#b0b0b0")
+            ax.gridlines(linewidth=0.3, color="#cccccc", draw_labels=True)
+            kw["transform"] = ccrs.PlateCarree()
+        else:
+            fig, ax = plt.subplots(figsize=(13, 7))
+            ax.set_xlim(-180, 180)
+            ax.set_ylim(-90, 90)
+            ax.set_aspect("equal")
+            ax.set_xticks(range(-180, 181, 30))
+            ax.set_yticks(range(-90, 91, 30))
+            ax.grid(linewidth=0.3, color="#cccccc")
+            ax.set_xlabel("longitude")
+            ax.set_ylabel("latitude")
+
+        if test_cells and cell_km:
+            boxes = []
+            for cell in test_cells:
+                lon0, lat0, lon1, lat1 = cell_bounds(cell, float(cell_km))
+                boxes.append(Rectangle((lon0, lat0), lon1 - lon0, lat1 - lat0))
+            ax.add_collection(
+                PatchCollection(
+                    boxes,
+                    facecolor=_MAP_COLOURS["test"],
+                    edgecolor=_MAP_COLOURS["test"],
+                    alpha=0.12,
+                    linewidth=0.5,
+                    **kw,
+                )
+            )
+
+        handles: List[Any] = []
+        for side in _MAP_SIDES:
+            part = sites.filter(pl.col("split") == side)
+            if part.height == 0:
+                continue
+            ax.scatter(
+                part.get_column("lon").to_numpy(),
+                part.get_column("lat").to_numpy(),
+                s=_map_dot_size(part.get_column("n").to_numpy()),
+                c=_MAP_COLOURS[side],
+                alpha=_MAP_ALPHA[side],
+                edgecolors="none",
+                zorder=3,
+                **kw,
+            )
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    linestyle="",
+                    marker="o",
+                    markersize=6,
+                    markerfacecolor=_MAP_COLOURS[side],
+                    markeredgecolor="none",
+                    alpha=_MAP_ALPHA[side],
+                    label=f"{_MAP_NAMES[side]}  (n={counts[side]})",
+                )
+            )
+        # The size key: the same scale on every map.
+        for n in _MAP_SIZE_KEY:
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    linestyle="",
+                    marker="o",
+                    markersize=float(np.sqrt(_map_dot_size(np.array([n]))[0])),
+                    markerfacecolor="none",
+                    markeredgecolor="#444444",
+                    label=f"{n} sample{'s' if n > 1 else ''} at a site",
+                )
+            )
+        if test_cells and cell_km:
+            # A PatchCollection has no legend entry of its own.
+            handles.append(
+                Patch(
+                    facecolor=_MAP_COLOURS["test"],
+                    edgecolor=_MAP_COLOURS["test"],
+                    alpha=0.12,
+                    label=f"test cells ({len(test_cells)})",
+                )
+            )
+        ax.legend(handles=handles, loc="lower left", fontsize=9, framealpha=0.9)
+        ax.set_title(head, fontsize=12)
+        fig.tight_layout()
+        return fig
+
     def plot_feature_importances(
         self,
         model: Any,
@@ -1061,7 +1440,10 @@ class Visualiser:
             if model_name:
                 title_parts.append(model_name)
             elif model_obj is not None:
-                title_parts.append(model_obj.__class__.__name__)
+                title_parts.append(
+                    getattr(model_obj, "model_name", None)
+                    or model_obj.__class__.__name__
+                )
             if feature_set or label or scheme_from_path or scheme:
                 fs = feature_set or "feature_set"
                 lb = label or "label"

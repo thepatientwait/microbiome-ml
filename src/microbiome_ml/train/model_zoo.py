@@ -173,7 +173,8 @@ def _normalise(name: str) -> str:
 
 def final_estimator(model: Any) -> Any:
     """The regressor inside a Pipeline (or the estimator itself)."""
-    return model.named_steps[STEP] if hasattr(model, "named_steps") else model
+    # last step, not STEP: cv.ScaledSVR names its regressor `svr`
+    return model.steps[-1][1] if hasattr(model, "steps") else model
 
 
 def feature_importance(
@@ -211,8 +212,9 @@ def fit_weighted(
     Pipeline."""
     if sample_weight is None:
         return model.fit(X, y)
-    if hasattr(model, "named_steps"):
-        return model.fit(X, y, **{f"{STEP}__sample_weight": sample_weight})
+    if hasattr(model, "steps"):
+        step = model.steps[-1][0]
+        return model.fit(X, y, **{f"{step}__sample_weight": sample_weight})
     return model.fit(X, y, sample_weight=sample_weight)
 
 

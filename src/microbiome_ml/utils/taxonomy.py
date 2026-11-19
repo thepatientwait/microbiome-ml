@@ -114,17 +114,3 @@ class TaxonomicRanks(IntEnum):
             pattern += f"(?:;{child.prefix}[^;]+)?"
 
         return pattern
-
-    def get_exact_regex(self) -> str:
-        """Regex matching taxonomy strings that END at exactly this rank.
-
-        In a filled profile each taxon has its own row whose string stops at
-        its rank (``d__A;p__X`` for phylum X). :meth:`get_regex` also matches
-        every descendant row because it is not anchored; use this one to
-        select the rows of one rank.
-
-        Examples:
-            >>> TaxonomicRanks.PHYLUM.get_exact_regex()
-            '(?:^|;)p__[^;]+$'
-        """
-        return f"(?:^|;){self.prefix}[^;]+$"

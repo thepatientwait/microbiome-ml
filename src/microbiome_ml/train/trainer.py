@@ -5,8 +5,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import polars as pl
+import scipy.sparse as sp
 from sklearn.base import clone
 
+from microbiome_ml.train.matrix import Matrix, feature_matrix, sparse_mode
 from microbiome_ml.train.metrics import regression_metrics
 from microbiome_ml.train.results import (
     CV_Result,
@@ -14,6 +16,7 @@ from microbiome_ml.train.results import (
     LabelSchemeKey,
 )
 from microbiome_ml.train.shap_analysis import SHAPAnalyser
+from microbiome_ml.transforms.labels import estimator_name
 from microbiome_ml.wrangle.dataset import Dataset
 
 BestResultInput = Union[
@@ -46,6 +49,8 @@ class ModelTrainer:
         - output_model_path: directory where the retrained model should be written or a file path
         - model_name: optional file name (defaults to "holdout model.pkl")
         - fillna: value to impute for any missing features in the holdout splits
+        - sparse: "auto" (default) keeps a mostly-zero feature table as a
+          CSR matrix, as CV does (see train/matrix.py); True/False force it
     """
 
     def __init__(
@@ -55,10 +60,12 @@ class ModelTrainer:
         output_model_path: Union[str, Path],
         model_name: Optional[str] = None,
         fillna: float = 0.0,
+        sparse: Union[str, bool, None] = "auto",
     ) -> None:
         """Initialize the trainer with the best CV result and dataset."""
         self.dataset = dataset
         self.fillna = fillna
+        self.sparse = sparse_mode(sparse)
         self.best_results, self._by_scheme = self._normalize_best_results(
             best_result
         )
@@ -268,8 +275,14 @@ class ModelTrainer:
         X_train, y_train, feature_cols = self._assemble_split(
             feature_df, train_df, label_name, cv_columns
         )
+        # The training layout, not "auto" again: auto decides per matrix,
+        # and an SVR fitted dense refuses a sparse test matrix.
         X_test, y_test, _ = self._assemble_split(
-            feature_df, test_df, label_name, cv_columns
+            feature_df,
+            test_df,
+            label_name,
+            cv_columns,
+            sparse=sp.issparse(X_train),
         )
 
         estimator = self._clone_estimator(best_result)
@@ -285,6 +298,8 @@ class ModelTrainer:
                 "feature_set": feature_set_name,
                 "label": label_name,
                 "scheme": best_result.scheme,
+                # the class name, as results_summary.csv records it
+                "model": estimator_name(estimator),
                 "n_test": len(y_test),
             }
         )
@@ -385,38 +400,54 @@ class ModelTrainer:
             estimator.set_params(**best_result.best_params)
         return estimator
 
-    def _materialize_feature_set(self, name: str) -> pl.DataFrame:
-        """Load the feature set by name and guarantee a `sample` column for
-        joins."""
+    def _materialize_feature_set(self, name: str) -> pl.LazyFrame:
+        """The feature set by name, lazily, with a `sample` column.
+
+        Lazy on purpose: collecting a genus table here held every sample
+        and taxon dense (17 GB for 16S marine) before a single row was
+        selected. `_assemble_split` reads only the rows it needs.
+        """
         feature_sets = self.dataset.feature_sets
         if name not in feature_sets:
             raise ValueError(
                 f"Feature set '{name}' is not registered on the dataset"
             )
 
-        feature_df = feature_sets[name].collect()
-        if "sample" not in feature_df.columns:
-            if "acc" in feature_df.columns:
-                feature_df = feature_df.rename({"acc": "sample"})
+        feature_set = feature_sets[name]
+        features = getattr(feature_set, "features", None)
+        if not isinstance(features, pl.LazyFrame):
+            features = feature_set.collect().lazy()
+        columns = features.collect_schema().names()
+        if "sample" not in columns:
+            if "acc" in columns:
+                features = features.rename({"acc": "sample"})
             else:
                 raise ValueError(
                     f"Feature set '{name}' is missing an accession column"
                 )
-        return feature_df
+        return features
 
     def _assemble_split(
         self,
-        feature_df: pl.DataFrame,
+        features: pl.LazyFrame,
         split_df: pl.DataFrame,
         label: str,
         columns: Optional[Sequence[str]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        sparse: Union[str, bool, None] = None,
+    ) -> Tuple[Matrix, np.ndarray, List[str]]:
         """Produce the feature matrix and target array for a specific split.
 
+        Rows in the split's order, labelled samples only; a sample with no
+        feature row gets `fillna`, as the left join this replaces did.
         ``columns`` restricts (and orders) the feature columns, e.g. to the
         ones a model was cross-validated on after feature selection.
+        *sparse* overrides the trainer's setting for this matrix.
         """
-        feature_cols = [col for col in feature_df.columns if col != "sample"]
+        if isinstance(features, pl.DataFrame):
+            features = features.lazy()
+        feature_cols = [
+            c for c in features.collect_schema().names() if c != "sample"
+        ]
         if columns:
             missing = [c for c in columns if c not in feature_cols]
             if missing:
@@ -430,20 +461,20 @@ class ModelTrainer:
                 "Feature set must provide at least one feature column"
             )
 
-        joined = split_df.join(feature_df, on="sample", how="left")
-        joined = joined.with_columns(
-            [pl.col(col).fill_null(self.fillna) for col in feature_cols]
-        )
-        joined = joined.filter(~pl.col(label).is_null())
-        if joined.is_empty():
+        keys = split_df.filter(~pl.col(label).is_null())
+        if keys.is_empty():
             raise ValueError(
                 "Holdout split contains no samples after combining with features"
             )
 
-        X = np.asarray(joined.select(feature_cols).to_numpy())
-        y = np.asarray(
-            joined.select(pl.col(label)).to_numpy().ravel(), dtype=float
+        X = feature_matrix(
+            features,
+            keys["sample"].to_list(),
+            feature_cols,
+            fillna=self.fillna,
+            sparse=self.sparse if sparse is None else sparse,
         )
+        y = np.asarray(keys[label].to_numpy(), dtype=float)
         return X, y, feature_cols
 
     def _require_feature_set(self, best_result: CV_Result) -> str:
