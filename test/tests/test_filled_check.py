@@ -50,3 +50,15 @@ def test_filled_check_rejects_parents_smaller_than_their_children():
         ("S1", "d__A;p__X;c__X2", 0.3),
     ]
     assert _profiles(rows)._detect_layout() == UNFILLED
+
+
+def test_unrounded_small_parents_get_no_rounding_allowance():
+    # Unrounded values, parents holding only their own reads, all below the
+    # 3-decimal rounding unit: no tolerance applies, so this stays unfilled.
+    rows = [
+        ("S1", "d__A", 0.00031),
+        ("S1", "d__A;p__X", 0.00011),
+        ("S1", "d__A;p__X;c__X1", 0.00017),
+        ("S1", "d__A;p__X;c__X2", 0.00023),
+    ]
+    assert _profiles(rows)._detect_layout() == UNFILLED

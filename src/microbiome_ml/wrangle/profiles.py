@@ -43,6 +43,19 @@ _MIN_PARENT_SHARE = 0.5
 _MAX_SHORT_SHARE = 0.01
 
 
+def _rounding_tolerance(values: pl.Series, max_decimals: int = 6) -> float:
+    """Half a unit of the last decimal when every value is rounded to at
+    most `max_decimals` decimals (5e-4 for three), else 0."""
+    v = values.drop_nulls().drop_nans()
+    if not v.len():
+        return 0.0
+    for d in range(max_decimals + 1):
+        scaled = v * 10**d
+        if ((scaled - scaled.round(0)).abs() < 1e-6).all():
+            return 0.5 * 10**-d
+    return 0.0
+
+
 def _tidy_taxonomy(expr: pl.Expr) -> pl.Expr:
     """`a; b` -> `a;b`, and drop trailing empty ranks (`o__X;f__;g__`).
 
@@ -506,11 +519,22 @@ class TaxonomicProfiles:
         ).height
         compared = (
             children.group_by(["sample", "parent"])
-            .agg(pl.col("value").sum().alias("child_sum"))
+            .agg(
+                pl.col("value").sum().alias("child_sum"),
+                pl.len().alias("n_children"),
+            )
             .join(parents, on=["sample", "parent"], how="inner")
         )
+        # Rounded abundances (e.g. to three decimals) can leave a filled
+        # parent a hair below the sum of its children: allow the rounding
+        # error of the parent and of each child. Only when the values really
+        # are rounded, so unrounded low-abundance parents are judged exactly.
+        tol = _rounding_tolerance(rows.get_column("value"))
         short = compared.filter(
-            pl.col("parent_value") < pl.col("child_sum") * (1 - 1e-6) - 1e-12
+            pl.col("parent_value")
+            < pl.col("child_sum") * (1 - 1e-6)
+            - (pl.col("n_children") + 1) * tol
+            - 1e-12
         ).height
 
         parent_share = with_parent / children.height

@@ -443,11 +443,6 @@ def test_create_features_streaming_matches_eager(tmp_path):
         assert eager[col].to_list() == streamed[col].to_list()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_detect_layout has no rounding allowance: a rounded filled "
-    "profile reads as unfilled (pass layout='filled')",
-)
 def test_rounded_filled_profiles_are_not_filled_again():
     """A parent a hair below the sum of its children (abundances rounded to
     three decimals) is still a filled profile: refilling would double count."""
