@@ -33,7 +33,7 @@ def test_build_fit_predict_and_importance(name):
 def test_scaled_models_are_pipelines_with_named_steps():
     for name in ("ridge", "en", "mlp"):
         est = zoo.build(name)
-        assert [s for s, _ in est.steps] == ["impute", "scale", "model"]
+        assert [s for s, _ in est.steps] == ["impute", "scale", "clip", "model"]
     assert not hasattr(zoo.build("rf"), "named_steps")
 
 
@@ -41,6 +41,27 @@ def test_scaled_models_impute_missing_values():
     X, y = _data()
     X[3, 1] = np.nan
     zoo.build("ridge").fit(X, y)  # would raise without the imputer
+
+
+@pytest.mark.parametrize("name", ["ridge", "en", "mlp"])
+def test_scaled_models_survive_an_almost_constant_feature(name):
+    # training SD ~1e-8 for feature 0, test value 1.0: without the clip step that is z ~ 1e7 and a wild prediction
+    rng = np.random.default_rng(0)
+    X, y = _data(n=200, p=4)
+    X[:, 0] = 1e-8 + rng.uniform(0, 1e-8, len(X))
+    est = zoo.build(name).fit(X, y)
+    X_test = X[:20].copy()
+    X_test[0, 0] = 1.0
+    pred = est.predict(X_test)
+    assert np.all(np.isfinite(pred))
+    assert np.abs(pred).max() < 100 * np.abs(y).max()
+
+
+def test_pickled_pipeline_needs_only_sklearn_and_numpy():
+    import pickle
+
+    est = zoo.build("ridge").fit(*_data())
+    assert b"microbiome_ml" not in pickle.dumps(est)
 
 
 def test_prefix_params_only_for_scaled_models():

@@ -10,7 +10,10 @@ named and how its feature importances are read.
 
 Linear models and the MLP are sensitive to feature scale (microbiome features
 easily span 1e-9 ... 1e7), so they are scikit-learn Pipelines with the steps
-``impute``, ``scale`` and ``model``. Their hyperparameters are written in a
+``impute``, ``scale``, ``clip`` and ``model``. ``clip`` limits the standardised
+features to +-CLIP_Z: a feature that is almost constant in the training data
+(SD ~1e-8) gives a test value of 1 a z-score of ~1e7, which ridge multiplies by
+its coefficient (test R2 down to -1e7 before this step existed). Their hyperparameters are written in a
 parameter file under the natural name (``alpha``) and addressed as
 ``model__alpha`` by :func:`prefix_params`. Pipelines pickle like any other
 estimator (no custom classes), so another environment needs only scikit-learn.
@@ -50,6 +53,7 @@ MODEL_SPECS: Dict[str, Tuple[str, str, bool, Dict[str, Any]]] = {
     ),
 }
 STEP = "model"
+CLIP_Z = 10.0  # standardised features beyond +-10 SD are never informative, only a blow-up risk
 
 # Human-friendly spellings accepted wherever a model is named.
 ALIASES: Dict[str, List[str]] = {
@@ -118,12 +122,14 @@ def build(name: str, **params: Any) -> Any:
         return estimator.set_params(**params) if params else estimator
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
     pipe = Pipeline(
         [
             ("impute", SimpleImputer(strategy="median")),
             ("scale", StandardScaler()),
+            # np.clip is a plain numpy function, so the pipeline still pickles without custom classes
+            ("clip", FunctionTransformer(np.clip, kw_args={"a_min": -CLIP_Z, "a_max": CLIP_Z})),
             (STEP, estimator),
         ]
     )
