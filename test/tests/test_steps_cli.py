@@ -41,8 +41,9 @@ def test_rank_features_command(tmp_path):
     df = pl.read_csv(out).sort("acc")
     assert df.columns[0] == "acc"
     assert sorted(df.columns[1:]) == ["p__X", "p__Y", "p__Z"]
-    assert df["p__X"].to_list() == [pytest.approx(0.6), pytest.approx(0.9), None]
-    assert df["p__Z"].to_list() == [None, None, 1.0]
+    # absent taxa are written as 0.0 (create_features fills them)
+    assert df["p__X"].to_list() == [pytest.approx(0.6), pytest.approx(0.9), 0.0]
+    assert df["p__Z"].to_list() == [0.0, 0.0, 1.0]
 
 
 def test_aggregate_command_matches_numpy(tmp_path):

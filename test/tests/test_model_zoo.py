@@ -122,6 +122,14 @@ def test_fit_weighted_routes_weights_through_pipelines():
     zoo.fit_weighted(zoo.build("rf", n_estimators=5), X, y, None)
 
 
+def test_importances_and_weights_reach_the_svm_inside_its_pipeline():
+    from microbiome_ml.train.cv import ScaledSVR
+
+    X, y = _data()
+    est = zoo.fit_weighted(ScaledSVR(), X, y, np.ones(len(y)))
+    assert zoo.feature_importance(est).sum() == pytest.approx(1.0)
+
+
 def test_predict_with_spread_for_forests():
     X, y = _data()
     est = zoo.build("rf", n_estimators=20, random_state=0).fit(X, y)
@@ -169,7 +177,7 @@ class _DS:
 def test_cross_validator_runs_zoo_models(tmp_path, mode, model, grid):
     p = tmp_path / "p.json"
     p.write_text(json.dumps({model: grid}))
-    cv = CrossValidator(_DS(), models=model, cv_folds=4, label="target", scheme="k")
+    cv = CrossValidator(_DS(), models=model, label="target", scheme="k")
     res = getattr(cv, mode)(param_path=str(p))
     assert res
     best = max(res.values(), key=lambda r: r.avg_validation_r2)

@@ -414,7 +414,8 @@ def test_create_features_uses_each_taxons_own_row():
     assert row["c__X1"] == pytest.approx(0.4)
     assert row["c__X2"] == pytest.approx(0.2)
     assert row["c__Y1"] == pytest.approx(0.4)
-    assert cls.filter(pl.col("sample") == "S2")["c__X2"].to_list() == [None]
+    # absent taxa are 0.0 in both the eager and the streamed table
+    assert cls.filter(pl.col("sample") == "S2")["c__X2"].to_list() == [0.0]
 
 
 def test_create_features_streaming_matches_eager(tmp_path):
@@ -464,7 +465,7 @@ def test_rounded_filled_profiles_are_not_filled_again():
     assert out["relabund"].to_list() == df.sort("taxonomy")["relabund"].to_list()
 
 
-def test_leaf_only_profiles_are_filled_by_summing_descendants():
+def test_leaf_only_profiles_are_summed_into_ranks():
     import polars as pl
 
     from microbiome_ml.wrangle.profiles import TaxonomicProfiles
@@ -478,7 +479,8 @@ def test_leaf_only_profiles_are_filled_by_summing_descendants():
         rows, schema=["sample", "taxonomy", "relabund"], orient="row"
     )
     profiles = TaxonomicProfiles(df.lazy())
-    assert profiles.is_filled
+    # read as unfilled: each taxon's total is summed from its rows
+    assert not profiles.is_filled
     phylum = profiles.create_features("phylum").collect()
     assert phylum["p__X"].to_list() == pytest.approx([0.5])
     assert phylum["p__Y"].to_list() == pytest.approx([0.5])
