@@ -43,6 +43,19 @@ _MIN_PARENT_SHARE = 0.5
 _MAX_SHORT_SHARE = 0.01
 
 
+def _rounding_tolerance(values: pl.Series, max_decimals: int = 6) -> float:
+    """Half a unit of the last decimal when every value is rounded to at
+    most `max_decimals` decimals (5e-4 for three), else 0."""
+    v = values.drop_nulls().drop_nans()
+    if not v.len():
+        return 0.0
+    for d in range(max_decimals + 1):
+        scaled = v * 10**d
+        if ((scaled - scaled.round(0)).abs() < 1e-6).all():
+            return float(0.5 * 10**-d)
+    return 0.0
+
+
 def _tidy_taxonomy(expr: pl.Expr) -> pl.Expr:
     """`a; b` -> `a;b`, and drop trailing empty ranks (`o__X;f__;g__`).
 
@@ -506,11 +519,22 @@ class TaxonomicProfiles:
         ).height
         compared = (
             children.group_by(["sample", "parent"])
-            .agg(pl.col("value").sum().alias("child_sum"))
+            .agg(
+                pl.col("value").sum().alias("child_sum"),
+                pl.len().alias("n_children"),
+            )
             .join(parents, on=["sample", "parent"], how="inner")
         )
+        # Rounded abundances (e.g. to three decimals) can leave a filled
+        # parent a hair below the sum of its children: allow the rounding
+        # error of the parent and of each child. Only when the values really
+        # are rounded, so unrounded low-abundance parents are judged exactly.
+        tol = _rounding_tolerance(rows.get_column("value"))
         short = compared.filter(
-            pl.col("parent_value") < pl.col("child_sum") * (1 - 1e-6) - 1e-12
+            pl.col("parent_value")
+            < pl.col("child_sum") * (1 - 1e-6)
+            - (pl.col("n_children") + 1) * tol
+            - 1e-12
         ).height
 
         parent_share = with_parent / children.height
@@ -854,6 +878,7 @@ class TaxonomicProfiles:
         icc_groups: Optional[pl.DataFrame] = None,
         max_icc: Optional[float] = None,
         icc_report: Optional[Union[str, Path]] = None,
+        id_column: str = "sample",
     ) -> SampleFeatureSet:
         """Create a SampleFeatureSet from the taxonomic profiles at a rank.
 
@@ -898,6 +923,8 @@ class TaxonomicProfiles:
             icc_report: Write the full ranked ICC table here as TSV.
                 Works without ``max_icc``, which is the intended first
                 use: look before filtering.
+            id_column: Name of the sample id column in a streamed table (the
+                in-memory path keeps ``sample``).
         Returns:
             SampleFeatureSet instance with features at the specified rank
         """
@@ -922,11 +949,14 @@ class TaxonomicProfiles:
         # rather than the taxon plus its descendants; filled tables are
         # small, so the extra pass is cheap.
         long_lf = self._rank_long(profiles_lf, rank)
+        if samples is not None:
+            long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
+        self._check_unique_tokens(
+            long_lf.select("taxonomy", "path").unique().collect(), rank
+        )
         if self.is_filled:
             long_lf = self._sum_rank_rows(long_lf)
         long_lf = long_lf.select(["sample", "taxonomy", "relabund"])
-        if samples is not None:
-            long_lf = long_lf.filter(pl.col("sample").is_in(list(samples)))
 
         mode = canonical_transform(transform)
 
@@ -991,7 +1021,32 @@ class TaxonomicProfiles:
             transform=mode,
             clr_pseudocount=float(clr_pseudocount),
             presence_threshold=float(presence_threshold),
+            id_column=id_column,
         )
+
+    @staticmethod
+    def _check_unique_tokens(
+        pairs: pl.DataFrame, rank: TaxonomicRanks
+    ) -> None:
+        """Raise if one rank token occurs under several lineages.
+
+        Feature columns are named by the rank token (``g__Foo``). If two
+        different lineages carried the same token their abundances would be
+        silently merged into one column.
+        """
+        dup = (
+            pairs.unique()
+            .group_by("taxonomy")
+            .agg(pl.col("path").n_unique().alias("n"))
+            .filter(pl.col("n") > 1)
+        )
+        if dup.height:
+            examples = dup.get_column("taxonomy").head(3).to_list()
+            raise ValueError(
+                f"{dup.height} {rank.name.lower()} name(s) occur under more "
+                f"than one lineage (e.g. {examples}); the feature columns "
+                "would merge distinct taxa"
+            )
 
     def _rank_long(
         self, lf: pl.LazyFrame, rank: TaxonomicRanks
@@ -1021,7 +1076,12 @@ class TaxonomicProfiles:
             out = out.with_columns(
                 pl.col("taxonomy").str.count_matches(";").alias(_DEPTH)
             )
-        return out.with_columns(pl.col("taxonomy").str.extract(token))
+        # `path`: the lineage down to this rank, for _check_unique_tokens.
+        lineage = rf"^(.*?(?:^|;){rank.prefix}[^;]+)(?:;|$)"
+        return out.with_columns(
+            pl.col("taxonomy").str.extract(token),
+            pl.col("taxonomy").str.extract(lineage).alias("path"),
+        )
 
     @staticmethod
     def _sum_rank_rows(frame: Any) -> Any:
@@ -1305,6 +1365,7 @@ class TaxonomicProfiles:
         transform: str = "relabund",
         clr_pseudocount: float = 1e-6,
         presence_threshold: float = 0.0,
+        id_column: str = "sample",
     ) -> SampleFeatureSet:
         """Pivot a rank to `stream_path` a chunk of samples at a time.
 
@@ -1409,7 +1470,7 @@ class TaxonomicProfiles:
                     transform,
                     clr_pseudocount=float(clr_pseudocount),
                     presence_threshold=float(presence_threshold),
-                )
+                ).rename({"sample": id_column})
                 if parquet:
                     wide.write_parquet(
                         stream_path / f"part_{part:05d}.parquet"

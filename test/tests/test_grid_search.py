@@ -270,7 +270,9 @@ _DETERMINISTIC = {"svm"}
 )
 def test_every_named_model_is_seeded(model):
     params = cv_module._MODEL_CONSTRUCTORS[model]().get_params()
-    assert params["random_state"] == cv_module.RANDOM_STATE
+    # the zoo's impute + scale pipelines seed their `model` step
+    seed = params.get("random_state", params.get("model__random_state"))
+    assert seed == cv_module.RANDOM_STATE
 
 
 def test_the_svm_has_nothing_to_seed():

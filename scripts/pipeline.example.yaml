@@ -329,7 +329,10 @@ cv:
   # Use it to check the splits are sane before paying for the models.
   enabled: true
   # Models to evaluate. Short names: rf (random forest), gb (gradient
-  # boosting), xgb / xgboost. Hyperparameters come from param_path.
+  # boosting), xgb / xgboost (optional dependency), ridge, en (elastic net)
+  # and mlp. ridge / en / mlp are wrapped in a median-impute + standardise
+  # pipeline; give their hyperparameters under the natural name (alpha, ...)
+  # in param_path. Hyperparameters come from param_path.
   models:
     - rf
     - xgboost

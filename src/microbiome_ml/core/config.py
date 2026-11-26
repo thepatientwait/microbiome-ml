@@ -7,7 +7,7 @@ processing workflows in the microbiome ML pipeline.
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import yaml  # type: ignore
 
@@ -22,6 +22,7 @@ class AggregationMethod(Enum):
     MEDIAN = "median"
     PRESENCE_ABSENCE = "presence_absence"
     TOP_K_ABUNDANT = "top_k_abundant"
+    RICHNESS = "richness"
     MAX_ABUNDANCE = "max_abundance"
     MIN_ABUNDANCE = "min_abundance"
     # Legacy methods for backward compatibility
@@ -50,7 +51,12 @@ class AggregationConfig:
 
     method: AggregationMethod
     weighting: WeightingStrategy = WeightingStrategy.ABUNDANCE
-    uncommon_feature_cutoff: int = 10
+    # Drop sample-level features that have a value in fewer samples than this.
+    # An int is a sample count; a float in (0, 1) is a fraction of samples.
+    uncommon_feature_cutoff: Union[int, float] = 10
+    # Aggregate this many feature columns at a time (None = all at once).
+    # Bounds the join/aggregation memory for very wide species tables.
+    chunk_columns: Optional[int] = None
     pseudocount: float = 1e-8
     min_abundance: float = 0.001
     k: int = 10  # for top_k_abundant method

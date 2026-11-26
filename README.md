@@ -49,6 +49,36 @@ for the cluster workflow, and
 [Comparing transforms in one sweep](#comparing-transforms-in-one-sweep) when
 you want to know whether CLR or presence/absence buys you anything.
 
+## Workflow steps and command line
+
+For file-based workflows (Snakemake, shell, a scheduler) `microbiome_ml.steps`
+has one function per rule, with explicit inputs and outputs and fixed table
+layouts, and `python -m microbiome_ml.cli` exposes them:
+
+| command | does | main outputs |
+|---|---|---|
+| `rank-features` | taxon abundance at one rank, streamed | `acc, <taxon>...` |
+| `aggregate` | species features -> sample features (lazy, optional column chunks, accession -> taxonomy map) | `acc, <feature>...` |
+| `partition` | group-aware, label-stratified train/test per label | `acc, <label>_partition` |
+| `select-features` | prevalence filter + Boruta on the **train** rows | `<features>, target, acc` for train and test |
+| `fit` | K-fold grid search, out-of-fold and test predictions | pickle, best-params YAML, `acc,real,pred`, metrics |
+| `logo` | leave-one-group-out with the tuned parameters | `acc,group,real,pred`, metrics, importances |
+| `logi` | leave-one-group-in: cross-validation inside each group plus a holdout of that group | the same, per group, plus holdout predictions/metrics |
+
+```bash
+python -m microbiome_ml.cli --log-file logs/fit.log --attempt 1 \
+  fit --train train.csv --test test.csv --model ridge \
+      --params-file hyperparameters.yaml \
+      --out-model m.pkl --out-params best.yaml --out-predictions cv.csv \
+      --out-test-predictions test.csv --out-test-metrics test_metrics.csv
+```
+
+`--log-file` sends stdout/stderr (including tracebacks and child processes)
+to the file: attempt 1 truncates it and later attempts append, each with a
+header line, which is the per-job log convention of the workflows. The exit
+status is non-zero on failure. Importing the CLI does not import scikit-learn
+or Boruta.
+
 ## Features
 
 - **Dataset Management**: Unified handling of taxonomic profiles, metadata, and labels with builder pattern API
@@ -810,6 +840,41 @@ label is skipped with a warning rather than given a degenerate split.
 Related helper: `Dataset.taxon_prevalence(rank)` returns
 `{taxon, n_present, n_samples, prevalence}` so you can see the candidates
 before committing to a split.
+
+### Genome-scale species tables
+
+`SpeciesFeatureSet` holds its table as one dense numpy array, which does not
+fit hundreds of thousands of genomes by thousands of columns. Pass
+`lazy=True` to keep the table as a scan (a Parquet file, a directory of
+`*.parquet` files, or a CSV whose feature columns are read as `Float64`) and
+let the aggregation join it to the profiles without ever loading it whole:
+
+```python
+dataset.add_species_features(
+    "genome_spot",
+    data="species_v2/parquet/genome_spot",   # directory of *.parquet
+    accession_col="acc",                      # key column of the table
+    lazy=True,
+    taxonomy_map="globdb_species_map.csv",    # acc -> taxonomy (one-to-one)
+)
+dataset.aggregate_species_to_samples(
+    "genome_spot", method="geometric_mean", weighting="abundance",
+    chunk_columns=500,                        # aggregate 500 columns at a time
+)
+```
+
+The map re-keys the table from genome accession to the taxonomy string used
+by the profiles. It must be one-to-one: a taxonomy with several rows would be
+counted several times, so the scan raises unless `duplicate_taxa="mean"` is
+given to `LazySpeciesFeatureSet.scan`. `chunk_columns` bounds the width of
+each join; the result is identical to aggregating all columns at once.
+
+Aggregation notes: `presence_absence` is a per-feature 0/1 (some species above
+`min_abundance` has the feature > 0); species richness and total abundance are
+the separate `richness` method. A weighted `median` falls back to the weighted
+mean with a warning, so ask for it unweighted. `uncommon_feature_cutoff` drops
+sample-level features that are non-null in fewer samples than the cutoff (an
+int) or fewer than that fraction of samples (a float in (0, 1)).
 
 ### Leave-one-group-out CV
 
@@ -1677,6 +1742,110 @@ CV_Result.export_result(
 )
 ```
 
+### Feature selection
+
+`FeatureSelector` reduces a wide feature matrix before modelling. The default
+is **Boruta** (all-relevant selection against shuffled shadow features) around
+a depth-7 random forest, preceded by a prevalence filter (`min_prevalence`,
+default 0.05: features non-null in fewer samples are dropped) and an optional
+importance screen (`screen_top_k`) that keeps Boruta tractable for thousands of
+columns. Run it on the **training samples only** so the holdout test set never
+influences which features are kept:
+
+```python
+from microbiome_ml.train.feature_selection import (
+    FeatureSelector, select_features_for_dataset,
+)
+
+sel = select_features_for_dataset(
+    dataset, "tax_genus", "ph",
+    FeatureSelector(method="boruta", perc=85, n_jobs=8),
+)
+sel.selected                       # kept feature names
+sel.save("out/selection/tax_genus~ph.csv")   # per-feature table + .json
+
+cv = CrossValidator(
+    dataset, models=["rf"], label="ph",
+    feature_subset={"tax_genus::ph": sel.selected},   # or "tax_genus": [...]
+)
+```
+
+`ModelTrainer` refits the CV winner on exactly the columns it was
+cross-validated on. Boruta is an optional dependency (extra `selection`); it
+pins old numpy / scikit-learn, so install it in an isolated environment. The
+`"screen"` and `"none"` methods need only scikit-learn.
+
+### Model types
+
+`models` takes short names (`"rf"`, `"gb"`, `"xgb"`, `"svm"`, `"ridge"`,
+`"en"`, `"mlp"`) or scikit-learn estimators; every stochastic one is seeded
+with `RANDOM_STATE`. `xgb` needs the optional `xgboost` package. `ridge`, `en`
+(elastic net) and `mlp` are wrapped in a median-impute + standardise pipeline
+(microbiome features span many orders of magnitude), and take their
+hyperparameters under the natural name in the parameter file (`alpha`,
+`l1_ratio`, ...); the module addresses them as `model__alpha`. As for every
+model, the parameter file needs a key for each one asked for (an empty
+`ridge:` means defaults).
+`microbiome_ml.train.model_zoo` also provides normalised feature importances
+for every type, `fit_weighted` and `predict_with_spread` (per-tree spread of
+a forest, the basis for locally weighted conformal intervals).
+
+### Out-of-fold predictions and leave-one-group-out
+
+After a run, attach per-sample out-of-fold predictions to the winners:
+
+```python
+cv.run(param_path="parameters.yaml")
+cv.add_oof_predictions()               # predict each sample from the other folds
+cv.add_oof_predictions(oof_folds=10)   # ... or from 10 random folds instead
+CV_Result.export_best_results_by_scheme(
+    cv.best_result_by_label_scheme, "out/best"
+)   # writes <label>/<scheme>/oof_predictions.csv  (sample, fold, real, pred)
+```
+
+Leave-one-group-out (LOGO) holds out each group (a bioproject, an
+ecoregion, ...) in turn and predicts it from all the others, which measures
+how well the model transfers to groups it has never seen:
+
+```python
+from sklearn.base import clone
+from microbiome_ml.train.validation import logo_for_dataset
+
+best = cv.best_result_by_label_scheme[("ph", "random")]
+res = logo_for_dataset(
+    dataset, best.feature_set, "ph", grouping="bioproject",
+    estimator=clone(best.model),          # keeps the tuned hyperparameters
+)                                         # runs on the holdout-train samples
+res.metrics       # pooled n, mae, mse, rmse, r2, q2, pcc, pval
+res.by_group      # one row per held-out group: n, mae, rmse, bias, r2
+res.save("out/logo", prefix="ph~tax_genus")
+```
+
+`leave_one_group_out` and `out_of_fold_predictions` also take plain arrays.
+
+**Leave-one-group-in (LOGI)** is the complement: how much signal is there
+*inside* each group? For every group (say an ecoregion) the model is
+cross-validated on that group's training rows alone and scored on a holdout of
+the same group:
+
+```python
+from microbiome_ml.train.validation import leave_one_group_in
+
+res = leave_one_group_in(
+    estimator, X, y,
+    groups=ecoregion, subgroups=bioproject, samples=ids, feature_names=names,
+)
+res.metrics            # per group: n_samples, mae, mse, rmse, r2, q2, pcc, pval, comment
+res.holdout_metrics    # the same on the group's holdout rows; comment = split method
+res.holdout_predictions, res.predictions, res.importances
+```
+
+The holdout keeps whole `subgroups` together (bioprojects) when the group has
+at least 5 of them and the split reaches `test_size`; otherwise it is split
+stratified by label bin, and at random if some bin is too small. A group with
+fewer than 25 labelled samples is skipped (reason in `comment`), as is one with
+fewer than 20 training rows or a constant label.
+
 ### Grid search on all four datasets
 
 `cv.run_grid` is a thin layer over sklearn's `GridSearchCV`: one search per
@@ -2064,6 +2233,26 @@ if cv.best_model_estimator is not None and cv.best_result is not None:
     )
     CV_Result.save_cv_result(cv.best_result, "out/best_result.ndjson")
 ```
+
+### Diagnostic figures
+
+`microbiome_ml.visualise.diagnostics` has the model-diagnostic figures as plain
+functions (arrays or frames in, a saved image or an open `Figure` out; `style`
+is a matplotlib style applied only while drawing):
+
+| function | figure |
+|---|---|
+| `plot_prediction_density` | actual vs predicted hexbin density, 1:1 and regression lines, fit statistics in the title |
+| `plot_two_panels` | two such panels (CV next to a held-out set; a group's CV next to its holdout) |
+| `plot_predictions_by_group` | the density plus a stacked error histogram coloured by a category (LOGO: the held-out group) |
+| `plot_logi_groups` | one two-panel figure per group (LOGI) |
+| `pca_embedding` + `plot_pca_overview` | PCA of the modelled features (fitted on train, test projected) coloured by group factors and by the label |
+| `plot_top_importances` | bars of the largest importances |
+
+`microbiome_ml.steps.plot_predictions`, `plot_logo_predictions`,
+`plot_logi_predictions`, `plot_pca` and `plot_feature_importances` draw them
+from the tables the other steps write (`acc,real,pred`, `acc,group,real,pred`,
+`<features>,target,acc`, a pickled model).
 
 ### Visualization
 

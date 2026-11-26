@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
@@ -32,6 +33,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Modelling (cross-validation, trainer, metrics)
+ml = [
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "joblib>=1.1.0",
+]
+# Figures
+viz = [
+    "matplotlib>=3.5.3",
+    "seaborn>=0.12.2",
+    "cmasher>=1.9.2",
+]
+xgb = ["xgboost>=1.7.0"]
+shap = ["shap>=0.44.0"]
+# Boruta feature selection (pins old numpy / scikit-learn: use an isolated env)
+selection = ["boruta_py>=0.3"]
 geo = [
     # Optional geospatial dependencies for annotation modules
     "netcdf4>=1.6.0",

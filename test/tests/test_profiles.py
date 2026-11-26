@@ -363,3 +363,144 @@ class TestTaxonomicProfilesQC:
             ValueError, match="must be in relative abundance format"
         ):
             profiles.filter_dominated_samples(dominated_cutoff=0.99)
+
+
+def _filled_rows(sample, leaves):
+    """Cumulative rank rows (domain..species) for leaf paths with abundances.
+
+    ``leaves`` maps "p/c/o/f/g/s" names to a relative abundance; every rank's
+    row carries the sum of its descendants, as in a filled profile.
+    """
+    prefixes = ["d", "p", "c", "o", "f", "g", "s"]
+    totals = {}
+    for path, value in leaves.items():
+        parts = ["A"] + path.split("/")
+        for depth in range(1, len(parts) + 1):
+            key = ";".join(f"{prefixes[i]}__{parts[i]}" for i in range(depth))
+            totals[key] = totals.get(key, 0.0) + value
+    return [(sample, tax, round(v, 6)) for tax, v in totals.items()]
+
+
+def test_create_features_uses_each_taxons_own_row():
+    """A phylum column must hold the phylum row's abundance, not the value of
+    one of its descendants (every rank has its own row in a filled profile)."""
+    import polars as pl
+
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    rows = _filled_rows(
+        "S1",
+        {
+            "X/X1/o/f/g/s1": 0.4,
+            "X/X2/o/f/g/s2": 0.2,
+            "Y/Y1/o/f/g/s3": 0.4,
+        },
+    ) + _filled_rows(
+        "S2", {"X/X1/o/f/g/s1": 0.9, "Y/Y1/o/f/g/s3": 0.1}
+    )
+    df = pl.DataFrame(
+        rows, schema=["sample", "taxonomy", "relabund"], orient="row"
+    )
+    profiles = TaxonomicProfiles(df.lazy())
+    assert profiles.is_filled
+
+    phylum = profiles.create_features("phylum").collect().sort("sample")
+    assert sorted(phylum.columns) == ["p__X", "p__Y", "sample"]
+    assert phylum["p__X"].to_list() == pytest.approx([0.6, 0.9])
+    assert phylum["p__Y"].to_list() == pytest.approx([0.4, 0.1])
+
+    cls = profiles.create_features("class").collect().sort("sample")
+    row = cls.row(0, named=True)
+    assert row["c__X1"] == pytest.approx(0.4)
+    assert row["c__X2"] == pytest.approx(0.2)
+    assert row["c__Y1"] == pytest.approx(0.4)
+    # absent taxa are 0.0 in both the eager and the streamed table
+    assert cls.filter(pl.col("sample") == "S2")["c__X2"].to_list() == [0.0]
+
+
+def test_create_features_streaming_matches_eager(tmp_path):
+    import polars as pl
+
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    rows = _filled_rows(
+        "S1", {"X/X1/o/f/g/s1": 0.6, "Y/Y1/o/f/g/s3": 0.4}
+    ) + _filled_rows("S2", {"X/X1/o/f/g/s1": 0.9, "Z/Z1/o/f/g/s9": 0.1})
+    df = pl.DataFrame(
+        rows, schema=["sample", "taxonomy", "relabund"], orient="row"
+    )
+    profiles = TaxonomicProfiles(df.lazy())
+    eager = profiles.create_features("phylum").collect().sort("sample")
+    streamed = (
+        profiles.create_features(
+            "phylum", stream_path=tmp_path / "p.csv", chunk_samples=1
+        )
+        .collect()
+        .sort("sample")
+    )
+    assert sorted(eager.columns[1:]) == sorted(streamed.columns[1:])
+    for col in eager.columns[1:]:
+        assert eager[col].to_list() == streamed[col].to_list()
+
+
+def test_rounded_filled_profiles_are_not_filled_again():
+    """A parent a hair below the sum of its children (abundances rounded to
+    three decimals) is still a filled profile: refilling would double count."""
+    import polars as pl
+
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    base = _filled_rows(
+        "S1", {"X/X1/o/f/g/s1": 0.0006, "X/X2/o/f/g/s2": 0.0006}
+    )
+    rows = [(s, t, round(v, 3)) for s, t, v in base]
+    # phylum X is now 0.001 while its two classes are 0.001 each
+    df = pl.DataFrame(
+        rows, schema=["sample", "taxonomy", "relabund"], orient="row"
+    )
+    profiles = TaxonomicProfiles(df.lazy())
+    assert profiles.is_filled
+    out = profiles.profiles.collect().sort("taxonomy")
+    assert out.height == df.height
+    assert out["relabund"].to_list() == df.sort("taxonomy")["relabund"].to_list()
+
+
+def test_leaf_only_profiles_are_summed_into_ranks():
+    import polars as pl
+
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    rows = [
+        ("S1", "d__A;p__X;c__X1;o__o;f__f;g__g;s__s1", 0.3),
+        ("S1", "d__A;p__X;c__X1;o__o;f__f;g__g;s__s2", 0.2),
+        ("S1", "d__A;p__Y;c__Y1;o__o;f__f;g__g;s__s3", 0.5),
+    ]
+    df = pl.DataFrame(
+        rows, schema=["sample", "taxonomy", "relabund"], orient="row"
+    )
+    profiles = TaxonomicProfiles(df.lazy())
+    # read as unfilled: each taxon's total is summed from its rows
+    assert not profiles.is_filled
+    phylum = profiles.create_features("phylum").collect()
+    assert phylum["p__X"].to_list() == pytest.approx([0.5])
+    assert phylum["p__Y"].to_list() == pytest.approx([0.5])
+
+
+def test_create_features_refuses_to_merge_taxa_sharing_a_name(tmp_path):
+    import polars as pl
+
+    from microbiome_ml.wrangle.profiles import TaxonomicProfiles
+
+    rows = _filled_rows("S1", {"X/X1/o/f/g/s1": 0.5}) + [
+        # the same genus name under another family
+        ("S1", "d__A;p__X;c__X1;o__o;f__f2", 0.5),
+        ("S1", "d__A;p__X;c__X1;o__o;f__f2;g__g", 0.5),
+        ("S1", "d__A;p__X;c__X1;o__o;f__f2;g__g;s__s7", 0.5),
+    ]
+    df = pl.DataFrame(
+        rows, schema=["sample", "taxonomy", "relabund"], orient="row"
+    )
+    profiles = TaxonomicProfiles(df.lazy(), check_filled=False)
+    for kwargs in ({}, {"stream_path": tmp_path / "g.csv"}):
+        with pytest.raises(ValueError, match="more than one lineage"):
+            profiles.create_features("genus", **kwargs)

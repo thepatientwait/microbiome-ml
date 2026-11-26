@@ -13,8 +13,10 @@ Example:
 
 import logging
 import os
+from functools import partial
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -44,8 +46,8 @@ from sklearn.svm import SVR
 
 # from sklearn.linear_model import ElasticNet, LinearRegression
 # from sklearn.neural_network import MLPRegressor
-from xgboost import XGBRegressor
 
+from microbiome_ml.train import model_zoo as zoo
 from microbiome_ml.train.full_fit import enable_oob, full_fit_diagnostics
 from microbiome_ml.train.matrix import feature_matrix, sparse_mode
 from microbiome_ml.train.results import (
@@ -123,13 +125,19 @@ class ScaledSVR(Pipeline):
         )
 
 
-_MODEL_CONSTRUCTORS = {
+_MODEL_CONSTRUCTORS: Dict[str, Callable[[], Any]] = {
     "rf": lambda: RandomForestRegressor(random_state=RANDOM_STATE),
     "gb": lambda: GradientBoostingRegressor(random_state=RANDOM_STATE),
-    "xgb": lambda: XGBRegressor(random_state=RANDOM_STATE),
+    # xgboost is optional: zoo.build imports it only when asked for.
+    "xgb": lambda: zoo.build("xgb", random_state=RANDOM_STATE),
     # Deterministic, so no seed. Fit time grows with the square of the sample
     # count or worse: fine at tens of thousands, not at 150,000.
     "svm": lambda: ScaledSVR(),
+    # Impute + scale pipelines from the model zoo (train/model_zoo.py).
+    **{
+        name: partial(zoo.build, name, model__random_state=RANDOM_STATE)
+        for name in ("ridge", "en", "mlp")
+    },
 }
 
 # Alias lists map many human-friendly synonyms to the canonical short keys above
@@ -168,6 +176,7 @@ _MODEL_ALIASES = {
         "support vector regression",
         "support vector regressor",
     ],
+    **{k: zoo.ALIASES[k] for k in ("ridge", "en", "mlp")},
 }
 
 
@@ -221,6 +230,14 @@ def _coerce_param_grid(raw: Optional[object]) -> object:
     if isinstance(raw, dict) and not raw:
         return [{}]
     return raw
+
+
+def _prefix_grid(model_key: str, grid: Any) -> Any:
+    """Grid keys as written (``alpha``) -> the zoo pipelines' step names
+    (``model__alpha``); other models' keys are unchanged."""
+    if model_key in zoo.MODEL_SPECS:
+        return zoo.prefix_grid(model_key, grid)
+    return grid
 
 
 def _normalize_alias(name: str) -> str:
@@ -320,6 +337,7 @@ class CrossValidator:
         label: Optional[Union[str, List[str]]] = None,
         scheme: Optional[Union[str, List[str]]] = None,
         feature_set: Optional[Union[str, List[str]]] = None,
+        feature_subset: Optional[Dict[str, List[str]]] = None,
         full_fit: bool = False,
         full_fit_oob: bool = True,
         target_transform: Optional[str] = None,
@@ -344,6 +362,11 @@ class CrossValidator:
         self.label: Optional[Union[str, List[str]]] = label
         self.scheme: Optional[Union[str, List[str]]] = scheme
         self.feature_set: Optional[Union[str, List[str]]] = feature_set
+        # Restrict the columns used per feature set (key ``"<feature_set>"``)
+        # or per feature set and label (key ``"<feature_set>::<label>"``, which
+        # wins), e.g. the output of FeatureSelector. Unlisted feature sets use
+        # all their columns.
+        self.feature_subset: Dict[str, List[str]] = dict(feature_subset or {})
         # Score the model that is already fitted on the whole CV pool.
         # Off by default: it costs one extra predict per combination,
         # and with `full_fit_oob` an out-of-bag pass on every fit.
@@ -376,6 +399,30 @@ class CrossValidator:
         self.best_model_estimator_by_label_scheme: Dict[
             LabelSchemeKey, Any
         ] = {}
+
+    def _columns_for(
+        self, feature_set: str, label: str, columns: List[str]
+    ) -> List[str]:
+        """Columns of ``feature_set`` to model for ``label`` (see
+        ``feature_subset``); keeps the table's column order."""
+        wanted = self.feature_subset.get(
+            f"{feature_set}::{label}", self.feature_subset.get(feature_set)
+        )
+        if wanted is None:
+            return columns
+        wanted_set = set(wanted)
+        missing = wanted_set - set(columns)
+        if missing:
+            raise ValueError(
+                f"feature_subset for '{feature_set}' names columns that are "
+                f"not in the feature set: {sorted(missing)[:5]}"
+            )
+        chosen = [c for c in columns if c in wanted_set]
+        if not chosen:
+            raise ValueError(
+                f"feature_subset for '{feature_set}' / '{label}' is empty"
+            )
+        return chosen
 
     def _reset_best_tracking(self) -> None:
         """Clear cached best-model selections before a fresh run."""
@@ -672,6 +719,66 @@ class CrossValidator:
         self._print_best_models_by_label()
         return results
 
+    def add_oof_predictions(
+        self,
+        oof_folds: Optional[int] = None,
+        seed: int = 0,
+        n_jobs: Optional[int] = None,
+    ) -> Dict[LabelSchemeKey, "pl.DataFrame"]:
+        """Attach out-of-fold predictions to the winner of every
+        (label, scheme).
+
+        Each sample of the scheme is predicted by the winning model refitted
+        on the other folds, giving the ``sample, fold, real, pred`` table the
+        downstream analyses (conformal intervals, hexbin plots, ensembles)
+        read. They are stored on ``result.oof_predictions`` and written as
+        ``oof_predictions.csv`` by the best-result exports.
+
+        Args:
+            oof_folds: ``None`` (default) uses the scheme's own folds. An
+                integer draws that many random folds instead (for example 10),
+                which reproduces a plain K-fold prediction on the same
+                samples.
+            seed: Seed for the random folds.
+            n_jobs: Parallel jobs for the predictions.
+
+        Returns:
+            The predictions keyed by (label, scheme).
+        """
+        from microbiome_ml.train.validation import out_of_fold_predictions
+
+        out: Dict[LabelSchemeKey, pl.DataFrame] = {}
+        for (label, scheme), result in self.best_result_by_label_scheme.items():
+            if result.model is None or result.feature_set is None:
+                continue
+            xy = self.dataset.get_xy(result.feature_set, str(label), "all")
+            scheme_df = self.dataset.splits[str(label)].cv_schemes[
+                str(scheme)
+            ]
+            fold_of = dict(
+                zip(scheme_df["sample"].to_list(), scheme_df["fold"].to_list())
+            )
+            keep = [i for i, s in enumerate(xy.samples) if s in fold_of]
+            samples = [xy.samples[i] for i in keep]
+            folds = (
+                None
+                if oof_folds
+                else np.array([fold_of[s] for s in samples], dtype=int)
+            )
+            oof = out_of_fold_predictions(
+                result.model,
+                xy.X[keep],
+                xy.y[keep],
+                samples=samples,
+                folds=folds,
+                n_splits=int(oof_folds or 10),
+                seed=seed,
+                n_jobs=n_jobs,
+            )
+            result.oof_predictions = oof
+            out[(label, scheme)] = oof
+        return out
+
     @staticmethod
     def _process_combo(
         payload: Tuple[
@@ -727,6 +834,7 @@ class CrossValidator:
                 grid = _coerce_param_grid(params_grid.get(model_key, [{}]))
                 for params in ParameterGrid(grid):
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
+                    params = _prefix_grid(model_key, params)
                     estimator.set_params(**params)
                     fold_jobs, threads = _fold_and_model_threads(
                         estimator, inner_cv_jobs, model_threads, combo_threads
@@ -958,7 +1066,9 @@ class CrossValidator:
                             f"expected the key '{model_key}', found "
                             f"{sorted(param_grids)}"
                         )
-                    grid = _coerce_param_grid(param_grids[model_key])
+                    grid = _prefix_grid(
+                        model_key, _coerce_param_grid(param_grids[model_key])
+                    )
                     estimator = _MODEL_CONSTRUCTORS[model_key]()
                 else:
                     # estimator instance: prefer class-name key, then canonical short keys
@@ -1334,6 +1444,9 @@ class CrossValidator:
                     # 3. Join labels and folds FIRST (both tiny), so the
                     # fold check can reject a combination before any
                     # feature data is read.
+                    cols_for = self._columns_for(
+                        feat_name, label_name, feature_cols
+                    )
                     ldf = label_df
                     label_value_col = next(
                         (c for c in ldf.columns if c != "sample"), None
@@ -1372,7 +1485,7 @@ class CrossValidator:
                     # (train/matrix.py): a dense genus matrix was 13.7 GB
                     # here, and each parallel fold worker copied it.
                     drop_cols = {"sample", "fold", label_value_col}
-                    columns = [c for c in feature_cols if c not in drop_cols]
+                    columns = [c for c in cols_for if c not in drop_cols]
                     X_np = feature_matrix(
                         feat_lf,
                         keys["sample"].to_list(),

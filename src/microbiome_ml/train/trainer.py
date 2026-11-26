@@ -6,11 +6,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 import numpy as np
 import polars as pl
 import scipy.sparse as sp
-from scipy.stats import pearsonr
 from sklearn.base import clone
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from microbiome_ml.train.matrix import Matrix, feature_matrix, sparse_mode
+from microbiome_ml.train.metrics import regression_metrics
 from microbiome_ml.train.results import (
     CV_Result,
     HoldoutEvaluation,
@@ -272,13 +271,18 @@ class ModelTrainer:
 
         feature_df = self._materialize_feature_set(feature_set_name)
 
+        cv_columns = best_result.feature_names or None
         X_train, y_train, feature_cols = self._assemble_split(
-            feature_df, train_df, label_name
+            feature_df, train_df, label_name, cv_columns
         )
         # The training layout, not "auto" again: auto decides per matrix,
         # and an SVR fitted dense refuses a sparse test matrix.
         X_test, y_test, _ = self._assemble_split(
-            feature_df, test_df, label_name, sparse=sp.issparse(X_train)
+            feature_df,
+            test_df,
+            label_name,
+            cv_columns,
+            sparse=sp.issparse(X_train),
         )
 
         estimator = self._clone_estimator(best_result)
@@ -428,12 +432,15 @@ class ModelTrainer:
         features: pl.LazyFrame,
         split_df: pl.DataFrame,
         label: str,
+        columns: Optional[Sequence[str]] = None,
         sparse: Union[str, bool, None] = None,
     ) -> Tuple[Matrix, np.ndarray, List[str]]:
         """Produce the feature matrix and target array for a specific split.
 
         Rows in the split's order, labelled samples only; a sample with no
         feature row gets `fillna`, as the left join this replaces did.
+        ``columns`` restricts (and orders) the feature columns, e.g. to the
+        ones a model was cross-validated on after feature selection.
         *sparse* overrides the trainer's setting for this matrix.
         """
         if isinstance(features, pl.DataFrame):
@@ -441,6 +448,14 @@ class ModelTrainer:
         feature_cols = [
             c for c in features.collect_schema().names() if c != "sample"
         ]
+        if columns:
+            missing = [c for c in columns if c not in feature_cols]
+            if missing:
+                raise ValueError(
+                    f"Feature columns used in CV are missing from the feature "
+                    f"set: {missing[:5]}"
+                )
+            feature_cols = list(columns)
         if not feature_cols:
             raise ValueError(
                 "Feature set must provide at least one feature column"
@@ -481,34 +496,5 @@ class ModelTrainer:
     ) -> Dict[str, Optional[float]]:
         """Compute MAE/MSE/R²/Q² and Pearson correlation for the holdout test
         set."""
-        y_true_arr = np.asarray(y_true)
-        y_pred_arr = np.asarray(y_pred)
-        if y_true_arr.size == 0 or y_pred_arr.size == 0:
-            return {
-                "mae": None,
-                "mse": None,
-                "r2": None,
-                "q2": None,
-                "pcc": None,
-                "pval": None,
-            }
-
-        metrics: Dict[str, Optional[float]] = {}
-        metrics["mae"] = mean_absolute_error(y_true_arr, y_pred_arr)
-        metrics["mse"] = mean_squared_error(y_true_arr, y_pred_arr)
-        metrics["r2"] = r2_score(y_true_arr, y_pred_arr)
-
-        denom = ((y_true_arr - np.mean(y_true_arr)) ** 2).sum()
-        metrics["q2"] = (
-            1 - ((y_true_arr - y_pred_arr) ** 2).sum() / denom
-            if denom > 0
-            else None
-        )
-
-        try:
-            metrics["pcc"], metrics["pval"] = pearsonr(y_true_arr, y_pred_arr)
-        except Exception:
-            metrics["pcc"] = None
-            metrics["pval"] = None
-
-        return metrics
+        m = regression_metrics(y_true, y_pred)
+        return {k: v for k, v in m.items() if k != "n"}
