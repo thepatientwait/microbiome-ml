@@ -21,7 +21,7 @@ import logging
 import sys
 from typing import Any, Callable, Dict, Optional, Sequence
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 logger = logging.getLogger("microbiome_ml.cli")
 
@@ -229,7 +229,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-level", default="INFO")
     sub = p.add_subparsers(dest="command", required=True)
 
-    def add(name: str, fn: Callable[[argparse.Namespace], None], help: str):
+    def add(
+        name: str, fn: Callable[[argparse.Namespace], None], help: str
+    ) -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help)
         sp.set_defaults(func=fn)
         return sp

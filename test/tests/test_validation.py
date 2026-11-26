@@ -138,15 +138,11 @@ def test_logo_null_groups_are_singletons():
 
 
 def test_logo_importances_skipped_for_models_without_them():
+    from sklearn.base import BaseEstimator, RegressorMixin
+
     X, y, g = _grouped_data()
 
-    class Const:
-        def get_params(self, deep=True):
-            return {}
-
-        def set_params(self, **p):
-            return self
-
+    class Const(RegressorMixin, BaseEstimator):
         def fit(self, X, y):
             self.m = float(np.mean(y))
             return self
@@ -302,8 +298,7 @@ from microbiome_ml.train.validation import (  # noqa: E402
 def _logi_data(seed=0):
     """Groups of different kinds, each with bioproject sub-groups."""
     rng = np.random.default_rng(seed)
-    rows = []  # group, bioproject, n
-    spec = [
+    spec = [  # group, bioprojects, samples per bioproject
         ("big", 12, 10),     # 120 samples, 12 bioprojects -> grouped holdout
         ("few_bp", 3, 20),   # 60 samples, 3 bioprojects -> stratified fallback
         ("tiny", 2, 6),      # 12 samples -> skipped (< 25 labelled)

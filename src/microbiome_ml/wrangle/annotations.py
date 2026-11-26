@@ -30,7 +30,7 @@ annotation is, as in a pivoted table, absent rather than all zeros).
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence, Union
+from typing import Any, Iterator, List, Optional, Sequence, Union
 
 import numpy as np
 import polars as pl
@@ -48,7 +48,7 @@ PathLike = Union[str, Path]
 _SEMICOLON_SPACE = r";\s+"
 
 
-def _sp():
+def _sp() -> Any:
     import scipy.sparse as sp  # imported lazily: scipy is optional elsewhere
 
     return sp
@@ -69,12 +69,12 @@ class AnnotationMatrix:
 
     taxa: List[str]
     features: List[str]
-    matrix: object
+    matrix: Any  # scipy.sparse.csr_matrix; scipy ships no types here
     n_genomes_in_table: int
     min_count: int
 
     @property
-    def shape(self):
+    def shape(self) -> Any:
         return self.matrix.shape
 
 
@@ -217,7 +217,7 @@ def scan_annotation_matrix(
     )
 
 
-def _weights(r: np.ndarray, weighting: WeightingStrategy) -> np.ndarray:
+def _weights(r: np.ndarray, weighting: WeightingStrategy) -> Any:
     if weighting == WeightingStrategy.NONE:
         return np.ones_like(r)
     if weighting == WeightingStrategy.ABUNDANCE:
@@ -227,7 +227,7 @@ def _weights(r: np.ndarray, weighting: WeightingStrategy) -> np.ndarray:
     raise ValueError(f"Unknown weighting strategy: {weighting}")
 
 
-def _column_median(sub, n: int) -> np.ndarray:
+def _column_median(sub: Any, n: int) -> Any:
     """Median of every column of a sparse (n x K) matrix, zeros included."""
     csc = sub.tocsc()
     csc.sort_indices()
@@ -237,15 +237,15 @@ def _column_median(sub, n: int) -> np.ndarray:
     nz = np.where(counts > 0)[0]
     if nz.size == 0:
         return out
-    col_of = np.repeat(np.arange(K), counts)
+    col_of: np.ndarray = np.repeat(np.arange(K), counts)
     order = np.lexsort((csc.data, col_of))
     srt = csc.data[order]
     zeros = n - counts[nz]
     lo, hi = (n - 1) // 2, n // 2
 
-    def at(pos):
+    def at(pos: int) -> np.ndarray:
         idx = pos - zeros
-        vals = np.zeros(nz.size)
+        vals: np.ndarray = np.zeros(nz.size)
         have = idx >= 0
         vals[have] = srt[csc.indptr[nz][have] + idx[have]]
         return vals
@@ -328,7 +328,7 @@ def iter_aggregate_annotations(
         b = min(a + chunk_samples, len(names))
         lo, hi = starts[a], ends[b - 1]
         nb = b - a
-        sample_in_chunk = np.repeat(np.arange(nb), ends[a:b] - starts[a:b])
+        sample_in_chunk: np.ndarray = np.repeat(np.arange(nb), ends[a:b] - starts[a:b])
         g, r = gi[lo:hi], r_all[lo:hi]
         out_names = names[a:b]
 
@@ -409,7 +409,7 @@ def iter_aggregate_annotations(
 def aggregate_annotations(
     annotations: AnnotationMatrix,
     relabund: pl.LazyFrame,
-    **kwargs,
+    **kwargs: Any,
 ) -> pl.DataFrame:
     """All chunks of :func:`iter_aggregate_annotations` as one frame."""
     parts = list(iter_aggregate_annotations(annotations, relabund, **kwargs))
@@ -476,18 +476,18 @@ def iter_kegg_completeness(
         ),
         shape=(len(ko_pos), len(feats)),
     ).tocsr()
-    size = sizes["len"].to_numpy().astype(float)
+    size: np.ndarray = sizes["len"].to_numpy().astype(float)
 
     present = annotations.matrix.copy()
     present.data = np.ones_like(present.data)
-    rel = relabund.select(
+    query = relabund.select(
         pl.col("sample"),
         pl.col("taxonomy").str.replace_all(_SEMICOLON_SPACE, ";"),
     )
     if samples is not None:
-        rel = rel.filter(pl.col("sample").is_in(list(samples)))
+        query = query.filter(pl.col("sample").is_in(list(samples)))
     rel = (
-        rel.join(
+        query.join(
             pl.DataFrame(
                 {
                     "taxonomy": annotations.taxa,
@@ -512,7 +512,7 @@ def iter_kegg_completeness(
     for a in range(0, len(names), chunk_samples):
         b = min(a + chunk_samples, len(names))
         lo, hi = starts[a], ends[b - 1]
-        rows = np.repeat(np.arange(b - a), ends[a:b] - starts[a:b])
+        rows: np.ndarray = np.repeat(np.arange(b - a), ends[a:b] - starts[a:b])
         S = sp.csr_matrix(
             (np.ones(hi - lo), (rows, g_all[lo:hi])),
             shape=(b - a, present.shape[0]),

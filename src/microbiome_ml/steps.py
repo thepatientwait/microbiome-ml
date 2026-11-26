@@ -18,11 +18,20 @@ Layouts (``acc`` is the sample id; ``target`` the label in model tables):
 import logging
 import pickle
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import polars as pl
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from microbiome_ml.train import model_zoo as zoo
 from microbiome_ml.train.metrics import regression_metrics
@@ -125,7 +134,7 @@ def aggregate_features(
     return out_path
 
 
-def _write_chunks(chunks, out: Path) -> int:
+def _write_chunks(chunks: Iterable[pl.DataFrame], out: Path) -> int:
     """Write an iterable of frames with identical columns as one CSV."""
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -457,7 +466,9 @@ def select_features_table(
     }
 
 
-def _read_model_table(path: PathLike, id_column: str = ID):
+def _read_model_table(
+    path: PathLike, id_column: str = ID
+) -> Tuple[pl.DataFrame, pl.Series, pl.Series]:
     df = pl.read_csv(str(path))
     return df.drop([id_column, TARGET]), df[TARGET], df[id_column]
 
@@ -905,7 +916,7 @@ def plot_pca(
         [id_column] + [pl.col(g).cast(pl.Utf8) for g in group_factors]
     )
     data = data.join(meta, on=id_column, how="left")
-    X = (
+    X: np.ndarray = (
         data.select(features).fill_null(0.0).fill_nan(0.0).to_numpy().astype(np.float64)
     )
     is_train = (data["split"] == "train").to_numpy()

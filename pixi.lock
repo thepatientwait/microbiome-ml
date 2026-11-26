@@ -8795,6 +8795,15 @@ packages:
   - requests>=2.25.0
   - tqdm>=4.64.0
   - pyyaml>=0.2.5
+  - scikit-learn>=1.0.0 ; extra == 'ml'
+  - scipy>=1.7.0 ; extra == 'ml'
+  - joblib>=1.1.0 ; extra == 'ml'
+  - matplotlib>=3.5.3 ; extra == 'viz'
+  - seaborn>=0.12.2 ; extra == 'viz'
+  - cmasher>=1.9.2 ; extra == 'viz'
+  - xgboost>=1.7.0 ; extra == 'xgb'
+  - shap>=0.44.0 ; extra == 'shap'
+  - boruta-py>=0.3 ; extra == 'selection'
   - netcdf4>=1.6.0 ; extra == 'geo'
   - rasterio>=1.3.0 ; extra == 'geo'
   - cdsapi>=0.6.0 ; extra == 'geo'

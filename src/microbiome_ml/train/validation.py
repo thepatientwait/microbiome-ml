@@ -293,7 +293,7 @@ HoldoutFn = Callable[..., Tuple[np.ndarray, np.ndarray, str, float]]
 
 
 def group_holdout_split(
-    y: Sequence[float],
+    y: Any,  # array-like of float
     subgroups: Sequence[Any],
     test_size: float = 0.2,
     seed: int = 42,

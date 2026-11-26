@@ -197,7 +197,8 @@ def feature_importance(
     else:
         raise ValueError(f"no feature importances for {type(est).__name__}")
     total = imp.sum()
-    return imp / total if total > 0 else imp
+    out: np.ndarray = imp / total if total > 0 else imp
+    return out
 
 
 def has_trees(model: Any) -> bool:

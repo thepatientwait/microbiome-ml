@@ -1588,26 +1588,26 @@ class Dataset:
         # Try to extract each field; skip (or raise, if strict) if missing
         extracted_fields = []
         missing_fields: List[str] = []
-        for field in fields_to_extract:
+        for wanted in fields_to_extract:
             try:
                 # Use the new metadata API to get the field
-                field_data = getattr(self.metadata, field)
+                field_data = getattr(self.metadata, wanted)
                 # Verify it has data by checking if we can collect at least one row
                 if field_data.head(1).collect().height > 0:
-                    extracted_fields.append(field)
+                    extracted_fields.append(wanted)
                 else:
-                    missing_fields.append(field)
+                    missing_fields.append(wanted)
             except AttributeError:
-                missing_fields.append(field)
+                missing_fields.append(wanted)
                 if not strict:
                     logger.warning(
-                        f"Field '{field}' not found in metadata, skipping"
+                        f"Field '{wanted}' not found in metadata, skipping"
                     )
             except Exception as e:
-                missing_fields.append(field)
+                missing_fields.append(wanted)
                 if not strict:
                     logger.warning(
-                        f"Could not extract field '{field}' from metadata: {e}"
+                        f"Could not extract field '{wanted}' from metadata: {e}"
                     )
 
         if strict and missing_fields:
