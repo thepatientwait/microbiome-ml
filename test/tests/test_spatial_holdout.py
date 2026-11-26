@@ -148,7 +148,7 @@ def _split(settings, seed=42):
     data, coords = _clustered()
     sm = SplitManager("temp")
     report, vario = sp.spatial_holdout(
-        sm, data, coords, settings, test_size=0.2, random_state=seed
+        sm, data, coords, settings, test_size=0.2, random_state=seed, method="grid"
     )
     return sm.holdout, coords, report, vario
 
@@ -214,7 +214,11 @@ def test_samples_without_coordinates_are_left_out():
     ).drop_nulls()
     sm = SplitManager("temp")
     report, _ = sp.spatial_holdout(
-        sm, data, coords, sp.SpatialSettings(cell_km=300.0, buffer_km=0)
+        sm,
+        data,
+        coords,
+        sp.SpatialSettings(cell_km=300.0, buffer_km=0),
+        method="grid",
     )
     assert report["n_no_coordinates"] == 2
     assert {"s0", "s1"}.isdisjoint(set(sm.holdout["sample"]))
@@ -248,7 +252,7 @@ def _dataset():
 
 def test_dataset_writes_the_holdout_and_both_reports(tmp_path):
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid", output_dir=tmp_path
     )
     holdout = pl.read_csv(tmp_path / "temp" / "holdout.csv")
     assert set(holdout["split"]) == {"train", "test", "buffer"}
@@ -267,7 +271,7 @@ def test_dataset_writes_the_holdout_and_both_reports(tmp_path):
 
 def test_cv_folds_leave_the_buffer_out():
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid"
     )
     ds.create_cv_folds(
         label="temp", grouping="random", use_holdout=True, force=True
@@ -279,6 +283,8 @@ def test_cv_folds_leave_the_buffer_out():
 
 
 def test_the_spatial_token():
+    assert sweep_tokens.holdout_spec("spatial_grid") == ("spatial", "grid")
+    assert sweep_tokens.spec_dir_name("spatial_grid") == "spatial_grid"
     assert sweep_tokens.holdout_spec("spatial") == ("spatial", None)
     assert sweep_tokens.holdout_spec("Spatial") == ("spatial", None)
     assert sweep_tokens.spec_dir_name("spatial") == "spatial"
@@ -305,7 +311,7 @@ def test_the_map_counts_every_side(tmp_path):
     from microbiome_ml.visualise.visualisations import Visualiser
 
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid", output_dir=tmp_path
     )
     holdout = ds.splits["temp"].holdout
     stats = Visualiser(tmp_path / "maps").plot_holdout_map(
@@ -324,7 +330,7 @@ def test_maps_are_drawn_for_spatial_runs_unless_asked(tmp_path):
     import run_cv_to_final_eval as pipeline
 
     _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid", output_dir=tmp_path
     )
     vis = {"enabled": True, "formats": ["png"]}
     pipeline.plot_holdout_maps(tmp_path, vis, tmp_path / "a", spatial=False)
@@ -466,8 +472,14 @@ def test_dataset_and_token_for_clusters(tmp_path):
     holdout = pl.read_csv(tmp_path / "temp" / "holdout.csv")
     assert holdout.columns[3] == "spatial_cluster"
     assert ds.spatial_report["method"].to_list() == ["cluster"]
-    assert sweep_tokens.holdout_spec("spatial_cluster") == ("spatial", "cluster")
-    assert sweep_tokens.holdout_spec("spatial:cluster") == ("spatial", "cluster")
+    assert sweep_tokens.holdout_spec("spatial_cluster") == (
+        "spatial",
+        "cluster",
+    )
+    assert sweep_tokens.holdout_spec("spatial:cluster") == (
+        "spatial",
+        "cluster",
+    )
     assert sweep_tokens.spec_dir_name("spatial_cluster") == "spatial_cluster"
     specs = sweep_tokens.run_specs(
         holdout_groupings=["spatial", "spatial_cluster"]
@@ -492,3 +504,141 @@ def test_cluster_settings_are_checked():
         sp.SpatialSettings.from_config({"max_cluster_share": 0})
     with pytest.raises(ValueError, match="Unknown"):
         sp.SpatialSettings.from_config({"cluster_neighbours": 0})
+
+
+# ---------------------------------------------------------------------------
+# stratified test clusters, and clusters as CV groups
+# ---------------------------------------------------------------------------
+def _archipelago(n_islands=60, sites=5, per_site=4, seed=0):
+    """Many tight islands (~10 km) over 1000 km apart, each with its own
+    label level, so which islands go to test decides the label mix."""
+    rng = np.random.default_rng(seed)
+    centres = [
+        (a, b) for a in range(-50, 51, 10) for b in range(-170, 171, 20)
+    ]
+    picked = rng.choice(len(centres), n_islands, replace=False)
+    lat, lon, label = [], [], []
+    for k in picked:
+        a, b = centres[k]
+        level = rng.uniform(0, 30)
+        la = np.repeat(a + rng.normal(0, 0.05, sites), per_site)
+        lo = np.repeat(b + rng.normal(0, 0.05, sites), per_site)
+        lat += list(la)
+        lon += list(lo)
+        label += list(level + rng.normal(0, 0.5, la.size))
+    samples = [f"s{i}" for i in range(len(lat))]
+    data = pl.DataFrame({"sample": samples, "temp": label})
+    coords = pl.DataFrame({"sample": samples, "lat": lat, "lon": lon})
+    return data, coords
+
+
+def _cluster_split(stratify, seed):
+    data, coords = _archipelago()
+    sm = SplitManager("temp")
+    settings = sp.SpatialSettings(
+        gap_km=100.0, max_cluster_share=0.05, stratify=stratify
+    )
+    report, _ = sp.spatial_holdout(
+        sm, data, coords, settings, method="cluster", random_state=seed
+    )
+    return sm, report, coords
+
+
+def test_stratified_pick_evens_out_the_label():
+    random_gaps, strat_gaps = [], []
+    for seed in range(8):
+        _, r, _ = _cluster_split(False, seed)
+        _, s, _ = _cluster_split(True, seed)
+        assert r["stratified"] is False and s["stratified"] is True
+        random_gaps.append(r["label_bin_max_gap"])
+        strat_gaps.append(s["label_bin_max_gap"])
+        # Still about test_size: a cluster that overfills its bins is
+        # passed over, so test can fall short by a few 20-sample islands.
+        assert abs(s["n_test"] - 0.2 * 1200) <= 60
+    assert np.mean(strat_gaps) < np.mean(random_gaps)
+
+
+def test_stratified_pick_keeps_the_distance():
+    sm, report, coords = _cluster_split(True, 3)
+    h = sm.holdout.join(coords, on="sample")
+    test = h.filter(pl.col("split") == "test")
+    train = h.filter(pl.col("split") == "train")
+    assert report["n_buffer"] == 0
+    assert not set(test["spatial_cluster"]) & set(train["spatial_cluster"])
+    d = _brute_nearest(train["lat"], train["lon"], test["lat"], test["lon"])
+    assert d.min() >= 100.0
+
+
+def test_stratified_pick_is_repeatable_and_respects_max_size():
+    groups = ["a"] * 50 + ["b"] * 10 + ["c"] * 10 + ["d"] * 10 + ["e"] * 20
+    bins = np.array([0] * 50 + [0] * 10 + [1] * 10 + [2] * 10 + [1] * 20)
+    first = sp.pick_test_groups_stratified(groups, bins, 0.2, 7, max_size=40)
+    assert first == sp.pick_test_groups_stratified(
+        groups, bins, 0.2, 7, max_size=40
+    )
+    assert "a" not in first  # 50 > max_size
+    assert sp.pick_test_groups_stratified([], np.zeros(0, int), 0.2, 1) == []
+
+
+def test_label_bins_are_equal_width():
+    bins = sp.label_bins(pl.Series([0.0, 1.0, 4.9, 5.0, 10.0]), 2)
+    assert bins.tolist() == [0, 0, 0, 1, 1]
+    assert sp.label_bins(pl.Series(["x", "y", "x"]), 5).tolist() == [0, 1, 0]
+
+
+def test_stratify_is_off_by_default_and_checked():
+    assert sp.SpatialSettings.from_config({}).stratify is False
+    assert sp.SpatialSettings.from_config({"stratify": "true"}).stratify
+    with pytest.raises(ValueError, match="stratify"):
+        sp.SpatialSettings.from_config({"stratify": "maybe"})
+
+
+def _cluster_dataset(stratify=False):
+    data, coords = _archipelago()
+    ds = Dataset()
+    ds.add_labels(data)
+    ds.metadata = SimpleNamespace(metadata=coords.lazy())
+    return ds.create_spatial_holdout_split(
+        spatial={
+            "gap_km": 100,
+            "max_cluster_share": 0.05,
+            "stratify": stratify,
+        },
+        method="cluster",
+    )
+
+
+@pytest.mark.parametrize("stratify", [False, True])
+def test_clusters_are_cv_groups(stratify):
+    ds = _cluster_dataset(stratify)
+    ds.create_cv_folds(
+        label="temp", grouping="spatial_cluster", use_holdout=True, force=True
+    )
+    folds = ds.splits["temp"].cv_schemes["spatial_cluster"]
+    holdout = ds.splits["temp"].holdout
+    train = holdout.filter(pl.col("split") == "train")
+    assert set(folds["sample"]) == set(train["sample"])
+    per_cluster = (
+        folds.join(train.select("sample", "spatial_cluster"), on="sample")
+        .group_by("spatial_cluster")
+        .agg(pl.col("fold").n_unique())
+    )
+    assert per_cluster["fold"].max() == 1  # a cluster never spans folds
+    assert folds["fold"].n_unique() == 5
+
+
+def test_all_groupings_include_the_clusters():
+    ds = _cluster_dataset()
+    ds.create_cv_folds(label="temp", grouping="all", use_holdout=True)
+    assert {"random", "spatial_cluster"} <= set(ds.splits["temp"].cv_schemes)
+
+
+def test_cluster_folds_need_a_cluster_holdout():
+    ds = _dataset().create_spatial_holdout_split(
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid"
+    )
+    with pytest.raises(ValueError, match="spatial_cluster"):
+        ds.create_cv_folds(label="temp", grouping="spatial_cluster")
+    # "all" without a cluster holdout simply has no cluster scheme
+    ds.create_cv_folds(label="temp", grouping="all", use_holdout=True)
+    assert "spatial_cluster" not in ds.splits["temp"].cv_schemes

@@ -12,8 +12,9 @@ from typing import Any, Dict, Optional, Tuple
 
 RANDOM = "random"  # directory/CLI name for "no holdout grouping"
 TAXON_PREFIX = "taxon_"  # dir-safe form of the "taxon:<rank>" token
-SPATIAL = "spatial"  # grid cells + buffer, sized by split.holdout.spatial
-SPATIAL_CLUSTER = "spatial_cluster"  # site clusters + buffer, same settings
+SPATIAL = "spatial"  # the default spatial method: site clusters
+SPATIAL_CLUSTER = "spatial_cluster"  # site clusters, named explicitly
+SPATIAL_GRID = "spatial_grid"  # grid cells + buffer, deprecated
 
 
 def holdout_spec(name: str) -> Tuple[str, Optional[str]]:
@@ -22,9 +23,10 @@ def holdout_spec(name: str) -> Tuple[str, Optional[str]]:
     random | null | none  -> ("column", None)   stratified random
     taxon:family          -> ("taxon", "family") community membership
     taxon_family          -> ("taxon", "family") (dir-safe spelling)
-    spatial               -> ("spatial", None)   grid cells + buffer
-    spatial_cluster       -> ("spatial", "cluster") site clusters + buffer
+    spatial               -> ("spatial", None)   the default: site clusters
+    spatial_cluster       -> ("spatial", "cluster") site clusters
     spatial:cluster       -> ("spatial", "cluster") (the same)
+    spatial_grid          -> ("spatial", "grid") grid cells + buffer, deprecated
     <anything else>       -> ("column", <name>) metadata grouping
     """
     text = name.strip()
@@ -34,6 +36,8 @@ def holdout_spec(name: str) -> Tuple[str, Optional[str]]:
         return ("spatial", None)
     if text.lower() in {SPATIAL_CLUSTER, "spatial:cluster"}:
         return ("spatial", "cluster")
+    if text.lower() in {SPATIAL_GRID, "spatial:grid"}:
+        return ("spatial", "grid")
     if text.startswith("taxon:"):
         return ("taxon", text.split(":", 1)[1])
     if text.startswith(TAXON_PREFIX):

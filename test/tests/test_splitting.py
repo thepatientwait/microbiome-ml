@@ -915,3 +915,30 @@ def test_taxon_holdout_finds_a_suffixed_feature_set(taxon_dataset):
 
     found = ds._rank_feature_set(TaxonomicRanks.FAMILY)
     assert found == f"{original}_clr"
+
+
+def _fold_sizes(groups, values):
+    sm = SplitManager("y")
+    sm.create_cv_folds(
+        pl.DataFrame(
+            {
+                "sample": [str(i) for i in range(len(groups))],
+                "y": values,
+                "g": groups,
+            }
+        ),
+        grouping="g",
+        n_folds=5,
+        scheme_name="s",
+    )
+    return sorted(sm.cv_schemes["s"]["fold"].value_counts()["count"].to_list())
+
+
+def test_cv_folds_stay_even_with_one_big_group():
+    groups = ["big"] * 40 + [f"g{i // 10}" for i in range(160)]
+    assert _fold_sizes(groups, [float(i % 7) for i in range(200)]) == [40] * 5
+
+
+def test_cv_folds_are_all_used_when_groups_share_no_bin():
+    groups = [name for name in "abcde" for _ in range(10)]
+    assert _fold_sizes(groups, list(groups)) == [10] * 5
