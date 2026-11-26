@@ -155,26 +155,9 @@ class SplitManager:
 
         group_list = df[group_col].unique(maintain_order=True).to_list()
 
-        # Calculate target counts per fold per bin
-        bin_counts = df.group_by("bin").len().sort("bin")
-        fold_targets = {}
-        for row in bin_counts.iter_rows(named=True):
-            bin_val = row["bin"]
-            total = row["len"]
-            fold_targets[bin_val] = [total // n_folds] * n_folds
-            # Distribute remainder
-            for i in range(total % n_folds):
-                fold_targets[bin_val][i] += 1
-
-        # Assign groups to folds using greedy algorithm
-        fold_groups: list[list[str]] = [[] for _ in range(n_folds)]
-        fold_remaining = {
-            bin_val: counts.copy() for bin_val, counts in fold_targets.items()
-        }
-
         # Every group's bin counts in one pass: filtering the frame once per
         # group is quadratic, and spatial clusters run to thousands of
-        # groups. Same counts, so the same folds.
+        # groups.
         bins_by_group: dict = {}
         for row in df.group_by([group_col, "bin"]).len().iter_rows(named=True):
             bins_by_group.setdefault(row[group_col], {})[row["bin"]] = row[
@@ -183,42 +166,32 @@ class SplitManager:
         group_sizes = {g: sum(b.values()) for g, b in bins_by_group.items()}
         fold_share = df.height / n_folds
         oversize = [g for g, n in group_sizes.items() if n > fold_share]
-        unplaced = 0
 
-        for group in group_list:
-            # Get bin distribution for this group
-            group_bins = bins_by_group.get(group, {})
+        # One row per group: its count in each bin.
+        bin_values = df["bin"].unique(maintain_order=True).to_list()
+        counts = np.array(
+            [
+                [bins_by_group[g].get(b, 0) for b in bin_values]
+                for g in group_list
+            ],
+            dtype=float,
+        )
+        want = counts.sum(axis=0) / n_folds
 
-            # Find best fold (one with most remaining capacity for this group)
-            best_fold = None
-            best_score = -1
-
-            for fold_idx in range(n_folds):
-                # Check if group fits in this fold
-                fits = True
-                score = 0
-                for bin_val, count in group_bins.items():
-                    if count > fold_remaining[bin_val][fold_idx]:
-                        fits = False
-                        break
-                    score += fold_remaining[bin_val][fold_idx]
-
-                if fits and score > best_score:
-                    best_fold = fold_idx
-                    best_score = score
-
-            # Assign to best fold (or first if none fit perfectly)
-            if best_fold is None:
-                best_fold = 0
-                unplaced += 1
-
-            fold_groups[best_fold].append(group)
-
-            # Update remaining counts
-            for bin_val, count in group_bins.items():
-                fold_remaining[bin_val][best_fold] = max(
-                    0, fold_remaining[bin_val][best_fold] - count
-                )
+        # Largest group first (ties keep the shuffled order), each into the
+        # fold where it adds least squared error to the bin targets. Ties go
+        # to the smallest fold, so groups sharing no bin do not pile up.
+        # Placing a group that fits nowhere in a default fold instead gave
+        # folds several times the intended size.
+        fold_groups: list[list[str]] = [[] for _ in range(n_folds)]
+        have = np.zeros((n_folds, len(bin_values)))
+        for i in np.argsort(-counts.sum(axis=1), kind="stable"):
+            added_error = (counts[i] * (counts[i] + 2 * (have - want))).sum(
+                axis=1
+            )
+            best_fold = int(np.lexsort((have.sum(axis=1), added_error))[0])
+            fold_groups[best_fold].append(group_list[i])
+            have[best_fold] += counts[i]
 
         # Create CV DataFrame with fold assignments
         fold_dfs = []
@@ -237,25 +210,22 @@ class SplitManager:
         cv_df = pl.concat(fold_dfs)
 
         # Fold balance. A group bigger than a fold's share cannot be
-        # balanced, and a group that fits no fold's remaining bins lands in
-        # fold 0 (kept as it was, so existing folds reproduce) -- both
-        # leave folds of uneven size, which the CV scores then inherit.
+        # balanced and leaves folds of uneven size, which the CV scores
+        # then inherit.
         if grouping is not None:
             sizes = [
                 int(cv_df.filter(pl.col("fold") == i).height)
                 for i in range(n_folds)
             ]
-            if oversize or unplaced:
+            if oversize:
                 logger.warning(
                     "CV scheme '%s' for '%s': %d group(s) larger than one "
-                    "fold's share (%.0f samples), largest %d; %d group(s) "
-                    "fit no fold and went to fold 0. Fold sizes: %s",
+                    "fold's share (%.0f samples), largest %d. Fold sizes: %s",
                     scheme_name,
                     self.label,
                     len(oversize),
                     fold_share,
-                    max(group_sizes.values()) if group_sizes else 0,
-                    unplaced,
+                    max(group_sizes.values()),
                     sizes,
                 )
             else:
