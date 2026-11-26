@@ -13,8 +13,10 @@ Example:
 
 import logging
 import os
+from functools import partial
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -123,7 +125,7 @@ class ScaledSVR(Pipeline):
         )
 
 
-_MODEL_CONSTRUCTORS = {
+_MODEL_CONSTRUCTORS: Dict[str, Callable[[], Any]] = {
     "rf": lambda: RandomForestRegressor(random_state=RANDOM_STATE),
     "gb": lambda: GradientBoostingRegressor(random_state=RANDOM_STATE),
     # xgboost is optional: zoo.build imports it only when asked for.
@@ -133,11 +135,7 @@ _MODEL_CONSTRUCTORS = {
     "svm": lambda: ScaledSVR(),
     # Impute + scale pipelines from the model zoo (train/model_zoo.py).
     **{
-        name: (
-            lambda _n=name: zoo.build(
-                _n, model__random_state=RANDOM_STATE
-            )
-        )
+        name: partial(zoo.build, name, model__random_state=RANDOM_STATE)
         for name in ("ridge", "en", "mlp")
     },
 }

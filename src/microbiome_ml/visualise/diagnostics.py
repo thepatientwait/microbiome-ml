@@ -71,6 +71,8 @@ def prediction_stats(
 ) -> Tuple[float, float, float, float]:
     """``(mse, r2, mae, pcc)`` of predictions against the actual values."""
     m = regression_metrics(values, predictions)
+    # only r2 and pcc can be undefined for non-empty input
+    assert m["mse"] is not None and m["mae"] is not None
     return (
         float(m["mse"]),
         float(m["r2"]) if m["r2"] is not None else float("nan"),
@@ -168,7 +170,16 @@ def hexbin_panel(
     return float(m), float(b)
 
 
-def _diagnostics_text(pcc, r2, m, b, mse, mae, n, two_lines: bool) -> str:
+def _diagnostics_text(
+    pcc: float,
+    r2: float,
+    m: float,
+    b: float,
+    mse: float,
+    mae: float,
+    n: int,
+    two_lines: bool,
+) -> str:
     sep = "\n" if two_lines else " | "
     return (
         f"R2: {r2:.3f} | PCC: {pcc:.3f} | MSE: {mse:.3f} | MAE: {mae:.3f}"
@@ -176,7 +187,20 @@ def _diagnostics_text(pcc, r2, m, b, mse, mae, n, two_lines: bool) -> str:
     )
 
 
-def _set_title(fig, title, pcc, r2, m, b, mse, mae, n, two_lines, y_title, y_stats):
+def _set_title(
+    fig: Any,
+    title: str,
+    pcc: float,
+    r2: float,
+    m: float,
+    b: float,
+    mse: float,
+    mae: float,
+    n: int,
+    two_lines: bool,
+    y_title: float,
+    y_stats: float,
+) -> None:
     fig.text(0.5, y_title, title, ha="center", va="center", fontsize="large", weight="bold")
     fig.text(
         0.5,
@@ -256,7 +280,7 @@ def plot_two_panels(
         return _finish(fig, file_name, dpi)
 
 
-def _group_palette(c: pl.Series, c_list: List[Any], cmap: str):
+def _group_palette(c: pl.Series, c_list: Any, cmap: str) -> Tuple[Any, Any, bool]:
     """Colours for the error histogram: ``(palette, hue, show_legend)``."""
     import cmasher as cmr
 
@@ -275,7 +299,7 @@ def _group_palette(c: pl.Series, c_list: List[Any], cmap: str):
                 item if item in most_common and item != "NA" else "Other"
                 for item in c_list
             ]
-            colors = {
+            colors: Any = {
                 label: sub(idx)
                 for idx, label in zip(np.linspace(0, 1, len(most_common)), most_common)
             }
@@ -288,13 +312,25 @@ def _group_palette(c: pl.Series, c_list: List[Any], cmap: str):
     return sub, c_list, False
 
 
-def _error_histogram(fig, hax, predictions, values, units, bins, trim, cax, c, cmap, cbar_label):
+def _error_histogram(
+    fig: Any,
+    hax: Any,
+    predictions: np.ndarray,
+    values: np.ndarray,
+    units: str,
+    bins: Any,
+    trim: Any,
+    cax: Any,
+    c: Any,
+    cmap: str,
+    cbar_label: Any,
+) -> Any:
     import matplotlib.ticker as ticker
     import seaborn as sns
 
     plt = _plt()
     diff = values - predictions
-    c_list = c.to_list() if c is not None else None
+    c_list: Any = c.to_list() if c is not None else None
     if trim:
         diff, c_list = remove_outliers_zscore(diff, c, trim)
     palette, hue, legend = _group_palette(c, c_list, cmap)
@@ -445,7 +481,9 @@ def pca_embedding(
     return pca.transform(X), pca.explained_variance_ratio_
 
 
-def collapse_levels(values: Sequence[Any], top_n: int = 10):
+def collapse_levels(
+    values: Sequence[Any], top_n: int = 10
+) -> Tuple[np.ndarray, List[Any], int, bool, bool]:
     """Keep the ``top_n`` most frequent levels, bucket the rest as ``other``
     and nulls as ``NA``. Returns ``(labels, top_levels, n_levels, has_other,
     has_na)``."""
@@ -472,7 +510,9 @@ def qualitative_colours(n: int) -> List[Any]:
     return [palette[i % len(palette)] for i in range(n)]
 
 
-def pca_view_limits(coords: np.ndarray, clip_percentile: Optional[float] = 0.5):
+def pca_view_limits(
+    coords: np.ndarray, clip_percentile: Optional[float] = 0.5
+) -> Tuple[Any, Any, int]:
     """Axis limits from pooled percentiles so outliers do not squash the plot.
     Returns ``(xlim, ylim, n_outside)``; ``None`` limits when disabled."""
     if not clip_percentile:
@@ -480,7 +520,7 @@ def pca_view_limits(coords: np.ndarray, clip_percentile: Optional[float] = 0.5):
     lo, hi = clip_percentile, 100 - clip_percentile
     limits = []
     for i in range(2):
-        a, b = np.percentile(coords[:, i], [lo, hi])
+        a, b = np.asarray(np.percentile(coords[:, i], [lo, hi]))
         pad = 0.1 * (b - a if b > a else 1.0)
         limits.append((a - pad, b + pad))
     xlim, ylim = limits
@@ -491,7 +531,19 @@ def pca_view_limits(coords: np.ndarray, clip_percentile: Optional[float] = 0.5):
     return xlim, ylim, int(outside.sum())
 
 
-def _pca_factor_panel(ax, coords, is_train, factor_values, name, evr, xlim, ylim, top_n, legend_max_levels, other_colour):
+def _pca_factor_panel(
+    ax: Any,
+    coords: np.ndarray,
+    is_train: np.ndarray,
+    factor_values: Sequence[Any],
+    name: str,
+    evr: np.ndarray,
+    xlim: Any,
+    ylim: Any,
+    top_n: int,
+    legend_max_levels: int,
+    other_colour: Any,
+) -> None:
     from matplotlib.lines import Line2D
 
     labels, top_levels, n_levels, has_other, has_na = collapse_levels(factor_values, top_n)
@@ -574,7 +626,7 @@ def plot_pca_overview(
             _pca_factor_panel(ax, coords, is_train, list(factors[name]), name, evr, xlim, ylim, top_n, legend_max_levels, other_colour)
         ax = flat[len(names)]
         y = np.asarray(target, dtype=float)
-        lo, hi = np.percentile(y, [1, 99])
+        lo, hi = np.asarray(np.percentile(y, [1, 99]))
         order = np.argsort(y)
         sc = None
         for mask, marker, edge, size in ((is_train, "o", "none", 14), (~is_train, "^", "k", 20)):

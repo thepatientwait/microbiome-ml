@@ -52,7 +52,7 @@ def _rounding_tolerance(values: pl.Series, max_decimals: int = 6) -> float:
     for d in range(max_decimals + 1):
         scaled = v * 10**d
         if ((scaled - scaled.round(0)).abs() < 1e-6).all():
-            return 0.5 * 10**-d
+            return float(0.5 * 10**-d)
     return 0.0
 
 

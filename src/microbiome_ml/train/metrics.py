@@ -1,14 +1,15 @@
 """Regression metrics shared by CV, holdout evaluation and LOGO."""
 
 import math
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 import numpy as np
+from numpy.typing import ArrayLike
 
 
 def regression_metrics(
-    y_true: Sequence[float],
-    y_pred: Sequence[float],
+    y_true: ArrayLike,
+    y_pred: ArrayLike,
     alternative: str = "two-sided",
 ) -> Dict[str, Optional[float]]:
     """Return n, mae, mse, rmse, r2, q2, pcc and pval for a set of
