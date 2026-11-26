@@ -1765,12 +1765,12 @@ class Dataset:
         spatial: Optional[Any] = None,
         force: bool = False,
         output_dir: Optional[Union[str, Path]] = None,
-        method: str = "grid",
+        method: str = "cluster",
     ) -> "Dataset":
         """Holdout split in space, with a buffer, for one or all labels.
 
-        Whole grid cells (method="grid") or site clusters
-        (method="cluster") go to test -- at random, or chosen to even out
+        Whole site clusters (method="cluster", the default) or grid cells
+        (method="grid", deprecated) go to test -- at random, or to even out
         the label's bins with ``spatial.stratify`` -- and, for the grid,
         training samples within the buffer distance of any test sample get
         ``split = "buffer"`` (in neither set). Distances are haversine;
@@ -1790,8 +1790,9 @@ class Dataset:
             force: If True, overwrite existing splits
             output_dir: If given, writes ``<label>/holdout.csv`` there,
                 plus ``spatial_report.tsv`` and ``spatial_variogram.tsv``.
-            method: "grid" (cells) or "cluster" (sites joined within a
-                gap; oversize clusters stay in training whole).
+            method: "cluster" (sites joined within a gap; oversize
+                clusters stay in training whole) or "grid" (cells,
+                deprecated).
 
         Returns:
             Self for chaining. The report and variogram are also kept on
@@ -1831,9 +1832,9 @@ class Dataset:
                 )
                 continue
             logger.info(
-                "Creating spatial holdout split for label: %s (whole grid "
-                "cells go to test; training samples near test are buffered)",
+                "Creating spatial holdout split for label: %s (method %s)",
                 lbl,
+                method,
             )
             if lbl not in self.splits:
                 self.splits[lbl] = SplitManager(lbl)

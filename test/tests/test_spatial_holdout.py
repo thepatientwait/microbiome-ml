@@ -148,7 +148,7 @@ def _split(settings, seed=42):
     data, coords = _clustered()
     sm = SplitManager("temp")
     report, vario = sp.spatial_holdout(
-        sm, data, coords, settings, test_size=0.2, random_state=seed
+        sm, data, coords, settings, test_size=0.2, random_state=seed, method="grid"
     )
     return sm.holdout, coords, report, vario
 
@@ -214,7 +214,11 @@ def test_samples_without_coordinates_are_left_out():
     ).drop_nulls()
     sm = SplitManager("temp")
     report, _ = sp.spatial_holdout(
-        sm, data, coords, sp.SpatialSettings(cell_km=300.0, buffer_km=0)
+        sm,
+        data,
+        coords,
+        sp.SpatialSettings(cell_km=300.0, buffer_km=0),
+        method="grid",
     )
     assert report["n_no_coordinates"] == 2
     assert {"s0", "s1"}.isdisjoint(set(sm.holdout["sample"]))
@@ -248,7 +252,7 @@ def _dataset():
 
 def test_dataset_writes_the_holdout_and_both_reports(tmp_path):
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid", output_dir=tmp_path
     )
     holdout = pl.read_csv(tmp_path / "temp" / "holdout.csv")
     assert set(holdout["split"]) == {"train", "test", "buffer"}
@@ -267,7 +271,7 @@ def test_dataset_writes_the_holdout_and_both_reports(tmp_path):
 
 def test_cv_folds_leave_the_buffer_out():
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid"
     )
     ds.create_cv_folds(
         label="temp", grouping="random", use_holdout=True, force=True
@@ -279,6 +283,8 @@ def test_cv_folds_leave_the_buffer_out():
 
 
 def test_the_spatial_token():
+    assert sweep_tokens.holdout_spec("spatial_grid") == ("spatial", "grid")
+    assert sweep_tokens.spec_dir_name("spatial_grid") == "spatial_grid"
     assert sweep_tokens.holdout_spec("spatial") == ("spatial", None)
     assert sweep_tokens.holdout_spec("Spatial") == ("spatial", None)
     assert sweep_tokens.spec_dir_name("spatial") == "spatial"
@@ -305,7 +311,7 @@ def test_the_map_counts_every_side(tmp_path):
     from microbiome_ml.visualise.visualisations import Visualiser
 
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid", output_dir=tmp_path
     )
     holdout = ds.splits["temp"].holdout
     stats = Visualiser(tmp_path / "maps").plot_holdout_map(
@@ -324,7 +330,7 @@ def test_maps_are_drawn_for_spatial_runs_unless_asked(tmp_path):
     import run_cv_to_final_eval as pipeline
 
     _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}, output_dir=tmp_path
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid", output_dir=tmp_path
     )
     vis = {"enabled": True, "formats": ["png"]}
     pipeline.plot_holdout_maps(tmp_path, vis, tmp_path / "a", spatial=False)
@@ -629,7 +635,7 @@ def test_all_groupings_include_the_clusters():
 
 def test_cluster_folds_need_a_cluster_holdout():
     ds = _dataset().create_spatial_holdout_split(
-        spatial={"cell_km": 300, "buffer_km": 150}
+        spatial={"cell_km": 300, "buffer_km": 150}, method="grid"
     )
     with pytest.raises(ValueError, match="spatial_cluster"):
         ds.create_cv_folds(label="temp", grouping="spatial_cluster")

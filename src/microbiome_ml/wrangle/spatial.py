@@ -1,4 +1,7 @@
-"""Spatial holdout: grid cells by distance, a haversine buffer, auto sizes.
+"""Spatial holdout: site clusters (default) or grid cells (deprecated).
+
+Sites joined within a gap (CLUSTERS, below) are the default method. The
+grid described first is deprecated and to be removed.
 
 A grouped holdout (bioproject) keeps studies apart but not places: in the
 18S_marine bioproject holdout, 24% of test samples had a training sample
@@ -876,14 +879,14 @@ def spatial_holdout(
     n_bins: int = 5,
     random_state: int = 42,
     metadata: Optional[pl.DataFrame] = None,
-    method: str = "grid",
+    method: str = "cluster",
 ) -> Tuple[Dict[str, Any], pl.DataFrame]:
     """Build *split_manager*'s holdout in space; returns (report, variogram).
 
     *data* is {sample, <label>}; *coords* is {sample, lat, lon} (see
     `coordinates`). Labelled samples without coordinates are left out of
-    the holdout, like samples without a label. *method* is "grid" (cells,
-    then a buffer) or "cluster" (no buffer needed). Test groups are picked
+    the holdout, like samples without a label. *method* is "cluster" (the
+    default, no buffer needed) or "grid" (cells then a buffer, deprecated). Test groups are picked
     without looking at the label, unless `settings.stratify`: then they
     are picked to even out *n_bins* equal-width label bins. The holdout
     keeps its usual columns plus the group (`spatial_cell` or
@@ -893,6 +896,11 @@ def spatial_holdout(
     if method not in METHODS:
         raise ValueError(
             f"spatial method must be one of {METHODS}, got {method!r}"
+        )
+    if method == "grid":
+        logger.warning(
+            "The grid spatial holdout is deprecated and will be removed; "
+            "use method='cluster' (holdout token spatial)"
         )
     group_col = _GROUP_COLUMN[method]
     label = split_manager.label

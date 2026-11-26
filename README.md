@@ -364,8 +364,8 @@ A sweep token is one of:
 | `<column>` | group-aware on that metadata column (added from metadata if needed) |
 | `taxon:<rank>` | community membership at that rank (see *Holding out by community membership*) |
 | `taxon_<rank>` | the same token, underscored |
-| `spatial` | whole grid cells to test, plus a buffer (see *Holding out in space*) |
-| `spatial_cluster` | whole site clusters to test, plus a buffer (the same section) |
+| `spatial` (or `spatial_cluster`) | whole site clusters to test (see *Holding out in space*) |
+| `spatial_grid` | **deprecated**: whole grid cells to test, plus a buffer (the same section) |
 
 ### Holding out in space
 
@@ -373,7 +373,28 @@ A grouped holdout keeps studies apart but not places. In the 18S_marine
 bioproject holdout, 24% of test samples had a training sample within 10 km
 and 59% within 50 km, so a model could score by recognising locations. The
 `spatial` token (`sweep.holdout_groupings: [spatial]`) splits in space
-instead:
+instead, by site clusters, deleting nothing: sites closer than `gap_km`
+join one cluster (single linkage, exactly -- a minimum spanning tree of the sites with the longer edges
+cut), so clusters are more than `gap_km` apart. Whole clusters go to test,
+picked at random until test holds about `test_size`; a training sample
+near a test sample would have joined its cluster, so there is nothing to
+buffer and no sample is deleted. A cluster with more than
+`max_cluster_share` of the samples (a dense region chained into one, or a
+heavily sampled station) is never picked and stays in training whole:
+cutting it would put close neighbours on both sides. Every step is
+deterministic: the same data, config and seed give the same split.
+
+```yaml
+split:
+  holdout:
+    spatial:
+      gap_km: auto              # km, or auto: largest of 25/50/100/200/400
+      max_cluster_share: 0.05   # bigger clusters never go to test
+      max_oversize_share: 0.5   # auto gap: at most this share too big
+      stratify: false           # true: pick test clusters to even the label
+```
+
+**Grid cells** (`spatial_grid`), deprecated and to be removed:
 
 1. every sample gets a grid cell about `cell_km` across, equal in width
    at every latitude (unlike a degree grid or Web Mercator metres);
@@ -406,30 +427,6 @@ buffer uses the same distance unless that would remove more than
 `max_buffer_loss` of the training samples, and is then shortened to remove
 exactly that share. A number is used as given.
 
-**Clusters instead of cells** (`spatial_cluster`), deleting nothing. Grid
-lines cut through dense patches of sites, and the buffer then deletes
-every training site near the cut. Clusters put the boundaries in the
-gaps: sites closer than `gap_km` join one cluster (single linkage,
-exactly -- a minimum spanning tree of the sites with the longer edges
-cut), so clusters are more than `gap_km` apart. Whole clusters go to test,
-picked at random until test holds about `test_size`; a training sample
-near a test sample would have joined its cluster, so there is nothing to
-buffer and no sample is deleted. A cluster with more than
-`max_cluster_share` of the samples (a dense region chained into one, or a
-heavily sampled station) is never picked and stays in training whole:
-cutting it would put close neighbours on both sides. Every step is
-deterministic: the same data, config and seed give the same split.
-
-```yaml
-split:
-  holdout:
-    spatial:
-      gap_km: auto              # km, or auto: largest of 25/50/100/200/400
-      max_cluster_share: 0.05   # bigger clusters never go to test
-      max_oversize_share: 0.5   # auto gap: at most this share too big
-      stratify: false           # true: pick test clusters to even the label
-```
-
 **Stratified test clusters** (`stratify: true`, grid or cluster). The
 groups and distances stay as they are; only the choice of which whole
 groups go to test looks at the label. The label is cut into
@@ -453,8 +450,8 @@ ITS_marine gap 400 km (13 test clusters), 18S_marine 200 km (144),
 ITS_soil 100 km (167). The price is that the few clusters too big for test
 -- 32 to 44% of the samples, in 2 to 4 dense regions -- are always in
 training, so test has no samples from them; `too_big_share` in the report
-says how much. Both tokens can run in one sweep (`holdout_groupings:
-[spatial, spatial_cluster]`); the report's `method` column says which is
+says how much. Both methods can run in one sweep (`holdout_groupings:
+[spatial, spatial_grid]`); the report's `method` column says which is
 which.
 
 A map of each label's train (blue), test (orange) and buffer (grey)

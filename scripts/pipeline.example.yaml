@@ -260,9 +260,10 @@ split:
     # Needs the matching feature set (features.ranks must include the rank).
     # Only labelled samples are considered. null = use `grouping` instead.
     taxon_rank: null
-    # Holdout token `spatial` only (sweep.holdout_groupings): whole grid
-    # cells go to test, and training samples nearer than buffer_km to a
-    # test sample are left out (split = buffer). Haversine distances.
+    # Spatial holdouts (sweep.holdout_groupings). Haversine distances.
+    # The cell_km to auto_max_km settings are for the DEPRECATED token
+    # `spatial_grid`: whole grid cells go to test, and training samples
+    # nearer than buffer_km to a test sample are left out (split = buffer).
     # auto = the label's variogram range; an auto buffer is shortened if
     # it would remove more than max_buffer_loss of training.
     spatial:
@@ -271,7 +272,7 @@ split:
       max_buffer_loss: 0.25
       auto_min_km: 10
       auto_max_km: 500
-      # Token `spatial_cluster` instead: sites closer than gap_km form one
+      # Token `spatial` (or `spatial_cluster`), the default method: sites closer than gap_km form one
       # cluster (clusters are then more than gap_km apart) and whole
       # clusters go to test, so no buffer is needed and nothing is
       # deleted. A cluster with more than max_cluster_share of the samples
@@ -315,11 +316,11 @@ split:
     # Which fold schemes to build (each scheme = a different way to cut the
     # train samples into folds):
     #   all      -> `random` + one scheme per grouping column, plus
-    #               `spatial_cluster` after a spatial_cluster holdout
+    #               `spatial_cluster` after a cluster spatial holdout
     #   random   -> only the ungrouped baseline
     #   <column> -> only that grouping (plus nothing else)
-    #   spatial_cluster -> the holdout's own clusters as groups (needs the
-    #               spatial_cluster holdout); folds are then gap_km apart
+    #   spatial_cluster -> the holdout's own clusters as groups (needs a
+    #               cluster spatial holdout); folds are then gap_km apart
     # Building schemes is cheap; use cv.scheme below to limit what is trained.
     grouping: all
     random_state: 42
