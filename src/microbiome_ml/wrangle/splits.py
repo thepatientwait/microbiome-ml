@@ -172,15 +172,22 @@ class SplitManager:
             bin_val: counts.copy() for bin_val, counts in fold_targets.items()
         }
 
+        # Every group's bin counts in one pass: filtering the frame once per
+        # group is quadratic, and spatial clusters run to thousands of
+        # groups. Same counts, so the same folds.
+        bins_by_group: dict = {}
+        for row in df.group_by([group_col, "bin"]).len().iter_rows(named=True):
+            bins_by_group.setdefault(row[group_col], {})[row["bin"]] = row[
+                "len"
+            ]
+        group_sizes = {g: sum(b.values()) for g, b in bins_by_group.items()}
+        fold_share = df.height / n_folds
+        oversize = [g for g, n in group_sizes.items() if n > fold_share]
+        unplaced = 0
+
         for group in group_list:
             # Get bin distribution for this group
-            group_bin_counts = (
-                df.filter(pl.col(group_col) == group).group_by("bin").len()
-            )
-            group_bins = {
-                row["bin"]: row["len"]
-                for row in group_bin_counts.iter_rows(named=True)
-            }
+            group_bins = bins_by_group.get(group, {})
 
             # Find best fold (one with most remaining capacity for this group)
             best_fold = None
@@ -203,6 +210,7 @@ class SplitManager:
             # Assign to best fold (or first if none fit perfectly)
             if best_fold is None:
                 best_fold = 0
+                unplaced += 1
 
             fold_groups[best_fold].append(group)
 
@@ -227,6 +235,37 @@ class SplitManager:
             fold_dfs.append(fold_df)
 
         cv_df = pl.concat(fold_dfs)
+
+        # Fold balance. A group bigger than a fold's share cannot be
+        # balanced, and a group that fits no fold's remaining bins lands in
+        # fold 0 (kept as it was, so existing folds reproduce) -- both
+        # leave folds of uneven size, which the CV scores then inherit.
+        if grouping is not None:
+            sizes = [
+                int(cv_df.filter(pl.col("fold") == i).height)
+                for i in range(n_folds)
+            ]
+            if oversize or unplaced:
+                logger.warning(
+                    "CV scheme '%s' for '%s': %d group(s) larger than one "
+                    "fold's share (%.0f samples), largest %d; %d group(s) "
+                    "fit no fold and went to fold 0. Fold sizes: %s",
+                    scheme_name,
+                    self.label,
+                    len(oversize),
+                    fold_share,
+                    max(group_sizes.values()) if group_sizes else 0,
+                    unplaced,
+                    sizes,
+                )
+            else:
+                logger.info(
+                    "CV scheme '%s' for '%s': %d groups, fold sizes %s",
+                    scheme_name,
+                    self.label,
+                    len(group_sizes),
+                    sizes,
+                )
 
         # Check if fewer folds than requested contain samples (can happen when
         # data/grouping diversity is limited and some folds remain empty).

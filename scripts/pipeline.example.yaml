@@ -277,10 +277,16 @@ split:
       # deleted. A cluster with more than max_cluster_share of the samples
       # never goes to test. auto gap = the largest of 25/50/100/200/400 km
       # leaving at most max_oversize_share of the samples in such
-      # clusters. Neither method looks at the label when picking test.
+      # clusters. Neither method looks at the label when picking test,
+      # unless stratify: true -- then whole groups are picked to even out
+      # the label's n_bins equal-width bins between train and test. The
+      # groups and distances do not change; test may end a few groups
+      # short of test_size. The report's label_bin_max_gap and label_ks
+      # say how even it came out (stratified or not).
       gap_km: auto
       max_cluster_share: 0.05
       max_oversize_share: 0.5
+      stratify: false
     presence_threshold: 0.0   # a taxon counts as present above this value
     min_test_samples: 2       # refuse a taxon leaving fewer on either side
     random_state: 42
@@ -308,9 +314,12 @@ split:
     logo_max_groups: 50
     # Which fold schemes to build (each scheme = a different way to cut the
     # train samples into folds):
-    #   all      -> `random` + one scheme per grouping column
+    #   all      -> `random` + one scheme per grouping column, plus
+    #               `spatial_cluster` after a spatial_cluster holdout
     #   random   -> only the ungrouped baseline
     #   <column> -> only that grouping (plus nothing else)
+    #   spatial_cluster -> the holdout's own clusters as groups (needs the
+    #               spatial_cluster holdout); folds are then gap_km apart
     # Building schemes is cheap; use cv.scheme below to limit what is trained.
     grouping: all
     random_state: 42

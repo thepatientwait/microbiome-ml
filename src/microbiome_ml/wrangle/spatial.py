@@ -69,6 +69,23 @@ delete nothing:
                   more than `max_oversize_share` of the samples sit in
                   clusters too big to go to test.
 
+STRATIFIED PICK (`stratify: true`, either method). The groups are as
+above -- the distances do not change -- but which whole groups go to
+test is no longer blind to the label. The label is cut into
+`split.holdout.n_bins` equal-width bins (as the stratified holdout cuts
+it), and groups are visited in the same seeded order; one is taken only
+if it fits within `test_size` and brings the test set's count in every
+bin closer to `test_size` of that bin's total (squared error summed over
+bins). Passes repeat until no group is taken. Distance stays the first
+priority: stratifying only chooses among whole groups, so every
+guarantee above still holds; the label mix is as even as the groups
+allow, not exact. Off by default, so existing splits reproduce.
+
+CLUSTERS AS CV GROUPS. The holdout carries `spatial_cluster` for every
+sample it places, so `split.cv.grouping: spatial_cluster` packs the
+training pool's clusters into stratified folds (Dataset.create_cv_folds):
+every fold is then more than `gap_km` from every other fold too.
+
 Every step is deterministic: same data, config and seed, same split.
 
 Config (all optional), under split.holdout:
@@ -83,6 +100,7 @@ Config (all optional), under split.holdout:
       gap_km: auto           # cluster: km, or auto
       max_cluster_share: 0.05
       max_oversize_share: 0.5
+      stratify: false        # pick test groups to even out the label bins
       lat_column: lat
       lon_column: lon
 
@@ -158,6 +176,20 @@ def _distance(value: Any, name: str, allow_zero: bool) -> Optional[float]:
     return km
 
 
+def _flag(value: Any, name: str) -> bool:
+    """A yes/no setting; refuses anything else rather than guess."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "1", "on"):
+        return True
+    if text in ("false", "no", "0", "off", "", "none", "null"):
+        return False
+    raise ValueError(
+        f"split.holdout.spatial.{name} must be true or false, got {value!r}"
+    )
+
+
 @dataclass(frozen=True)
 class SpatialSettings:
     """How a spatial holdout is built; None for a distance means auto."""
@@ -171,6 +203,7 @@ class SpatialSettings:
     gap_km: Optional[float] = None
     max_cluster_share: float = 0.05
     max_oversize_share: float = 0.5
+    stratify: bool = False
     lat_column: str = "lat"
     lon_column: str = "lon"
     # Variogram sampling: every site is a candidate, these bound the work.
@@ -179,7 +212,9 @@ class SpatialSettings:
     variogram_random_pairs: int = 200_000
 
     @classmethod
-    def from_config(cls, cfg: Optional[Mapping[str, Any]]) -> "SpatialSettings":
+    def from_config(
+        cls, cfg: Optional[Mapping[str, Any]]
+    ) -> "SpatialSettings":
         cfg = dict(cfg or {})
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(cfg) - known)
@@ -198,6 +233,7 @@ class SpatialSettings:
             gap_km=_distance(cfg.get("gap_km", AUTO), "gap_km", False),
             max_cluster_share=float(cfg.get("max_cluster_share", 0.05)),
             max_oversize_share=float(cfg.get("max_oversize_share", 0.5)),
+            stratify=_flag(cfg.get("stratify", False), "stratify"),
             lat_column=str(cfg.get("lat_column", "lat")),
             lon_column=str(cfg.get("lon_column", "lon")),
             variogram_sites=int(cfg.get("variogram_sites", 5000)),
@@ -238,7 +274,9 @@ def coordinates(
     metadata: pl.DataFrame, lat_column: str = "lat", lon_column: str = "lon"
 ) -> pl.DataFrame:
     """{sample, lat, lon} for every sample with valid coordinates."""
-    missing = [c for c in (lat_column, lon_column) if c not in metadata.columns]
+    missing = [
+        c for c in (lat_column, lon_column) if c not in metadata.columns
+    ]
     if missing:
         raise ValueError(
             f"A spatial holdout needs coordinates; metadata has no {missing} "
@@ -489,9 +527,9 @@ def cluster_ids(
     if lat_a.size == 0:
         return [], info
     site_xy, inverse = _sites(lat_a, lon_a)
-    weights: np.ndarray = np.bincount(
-        inverse, minlength=len(site_xy)
-    ).astype(np.float64)
+    weights: np.ndarray = np.bincount(inverse, minlength=len(site_xy)).astype(
+        np.float64
+    )
     parent, edge_km = _spanning_tree(site_xy)
     gap = (
         float(gap_km)
@@ -555,6 +593,131 @@ def pick_test_groups(
         if best is not None:
             chosen.append(best)
     return sorted(chosen)
+
+
+def label_bins(values: pl.Series, n_bins: int) -> np.ndarray:
+    """Bin index of each value: equal-width bins for a numeric label.
+
+    The same cut as the stratified holdout and k-fold use (`n_bins`
+    equal-width bins between the min and the max, left-closed), so a
+    stratified spatial split is balanced on the bins the rest of the
+    pipeline reports. A non-numeric label is binned by its classes.
+    """
+    # Annotated, not returned directly: numpy's stubs type these as Any,
+    # which mypy's no-any-return rejects.
+    out: np.ndarray
+    if values.len() == 0:
+        out = np.zeros(0, dtype=np.int64)
+    elif values.dtype.is_numeric():
+        x = values.cast(pl.Float64).to_numpy()
+        breaks = np.linspace(float(np.min(x)), float(np.max(x)), n_bins + 1)
+        out = np.digitize(x, breaks[1:-1], right=False).astype(np.int64)
+    else:
+        _, codes = np.unique(
+            values.cast(pl.Utf8).to_numpy(), return_inverse=True
+        )
+        out = np.asarray(codes, dtype=np.int64)
+    return out
+
+
+def pick_test_groups_stratified(
+    groups: List[str],
+    bins: np.ndarray,
+    test_size: float,
+    seed: int,
+    max_size: Optional[float] = None,
+) -> List[str]:
+    """Whole groups for test, chosen to even out the label bins.
+
+    *groups* and *bins* give each sample's group and label bin. Groups
+    are visited in the seeded order `pick_test_groups` uses, and one is
+    taken only if it keeps the test set within `test_size` of the samples
+    and lowers the squared error between test's count in each bin and
+    `test_size` of that bin's total. Passes repeat until a pass takes
+    nothing; then, if test is still short, the one group that lowers the
+    error most is added even past the target, as the random pick does.
+    A group that would overfill its bins is passed over, so test can end
+    a few groups short of `test_size`: the label mix is bought with a
+    little size. Groups above `max_size` samples are never taken. Same
+    input and seed, same groups.
+    """
+    names = sorted(set(groups))
+    if not names:
+        return []
+    index = {name: i for i, name in enumerate(names)}
+    g = np.fromiter(
+        (index[x] for x in groups), dtype=np.int64, count=len(groups)
+    )
+    n_bins = int(bins.max()) + 1 if bins.size else 1
+    counts = np.zeros((len(names), n_bins), dtype=np.float64)
+    np.add.at(counts, (g, bins), 1.0)
+    sizes = counts.sum(axis=1)
+    total = float(sizes.sum())
+    target = int(round(test_size * total))
+    want = test_size * counts.sum(axis=0)
+
+    order = np.random.default_rng(seed).permutation(len(names)).tolist()
+    eligible = [i for i in order if max_size is None or sizes[i] <= max_size]
+    have = np.zeros(n_bins, dtype=np.float64)
+    n = 0.0
+    taken: set[int] = set()
+
+    def delta(i: int) -> float:
+        # Change in sum_b (have_b - want_b)^2 from adding group i.
+        row = counts[i]
+        return float(np.dot(row, row + 2.0 * (have - want)))
+
+    changed = True
+    while changed and n < target:
+        changed = False
+        for i in eligible:
+            if i in taken or n + sizes[i] > target:
+                continue
+            if delta(i) < 0:
+                taken.add(i)
+                have += counts[i]
+                n += sizes[i]
+                changed = True
+    if n < target:
+        best: Optional[int] = None
+        best_delta = 0.0
+        for i in eligible:
+            if i in taken:
+                continue
+            d = delta(i)
+            if d < best_delta:
+                best, best_delta = i, d
+        if best is not None:
+            taken.add(best)
+    return sorted(names[i] for i in taken)
+
+
+def _label_balance(
+    label: pl.Series, is_test: np.ndarray, n_bins: int
+) -> Tuple[Optional[float], Optional[float]]:
+    """(largest bin-share gap test vs all, KS statistic train vs test).
+
+    Both None when the label is not numeric or a side is empty.
+    """
+    if not label.dtype.is_numeric() or not is_test.any() or is_test.all():
+        return None, None
+    x = label.cast(pl.Float64).to_numpy()
+    bins = label_bins(label, n_bins)
+    k = int(bins.max()) + 1
+    share_all = np.bincount(bins, minlength=k) / bins.size
+    share_test = np.bincount(bins[is_test], minlength=k) / is_test.sum()
+    gap = float(np.max(np.abs(share_test - share_all)))
+    a, b = np.sort(x[~is_test]), np.sort(x[is_test])
+    grid = np.concatenate([a, b])
+    ks = float(
+        np.max(
+            np.abs(
+                np.searchsorted(a, grid, side="right") / a.size
+                - np.searchsorted(b, grid, side="right") / b.size
+            )
+        )
+    )
+    return gap, ks
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +785,9 @@ def variogram(
     i: np.ndarray = all_i[distinct]
     j: np.ndarray = all_j[distinct]
 
-    d = haversine_km(site_xy[i, 0], site_xy[i, 1], site_xy[j, 0], site_xy[j, 1])
+    d = haversine_km(
+        site_xy[i, 0], site_xy[i, 1], site_xy[j, 0], site_xy[j, 1]
+    )
     gamma: np.ndarray = 0.5 * (z[i] - z[j]) ** 2
     n_bins = len(_BIN_EDGES) - 1
     b: np.ndarray = np.asarray(np.digitize(d, _BIN_EDGES), dtype=np.intp) - 1
@@ -719,13 +884,16 @@ def spatial_holdout(
     `coordinates`). Labelled samples without coordinates are left out of
     the holdout, like samples without a label. *method* is "grid" (cells,
     then a buffer) or "cluster" (no buffer needed). Test groups are picked
-    without looking at the label, so *n_bins* is not used. The holdout
+    without looking at the label, unless `settings.stratify`: then they
+    are picked to even out *n_bins* equal-width label bins. The holdout
     keeps its usual columns plus the group (`spatial_cell` or
     `spatial_cluster`) and, for training and buffer rows,
     `nearest_test_km`.
     """
     if method not in METHODS:
-        raise ValueError(f"spatial method must be one of {METHODS}, got {method!r}")
+        raise ValueError(
+            f"spatial method must be one of {METHODS}, got {method!r}"
+        )
     group_col = _GROUP_COLUMN[method]
     label = split_manager.label
     labelled = data.select("sample", label).drop_nulls(subset=[label])
@@ -786,7 +954,9 @@ def spatial_holdout(
     cell_km: Optional[float] = None
     cluster_info: Dict[str, Any] = {}
     if method == "grid":
-        cell_km = settings.cell_km if settings.cell_km is not None else range_km
+        cell_km = (
+            settings.cell_km if settings.cell_km is not None else range_km
+        )
         assert cell_km is not None
         groups = cell_ids(lat, lon, cell_km)
         target = range_km if range_km is not None else settings.auto_max_km
@@ -810,16 +980,23 @@ def spatial_holdout(
     group_sizes: Dict[str, int] = {}
     for name in groups:
         group_sizes[name] = group_sizes.get(name, 0) + 1
-    test_groups = pick_test_groups(
-        group_sizes,
-        test_size,
-        random_state,
-        max_size=(
-            settings.max_cluster_share * frame.height
-            if method == "cluster"
-            else None
-        ),
+    max_size = (
+        settings.max_cluster_share * frame.height
+        if method == "cluster"
+        else None
     )
+    if settings.stratify:
+        test_groups = pick_test_groups_stratified(
+            groups,
+            label_bins(frame.get_column(label), n_bins),
+            test_size,
+            random_state,
+            max_size=max_size,
+        )
+    else:
+        test_groups = pick_test_groups(
+            group_sizes, test_size, random_state, max_size=max_size
+        )
     split_manager.holdout = split_manager._enrich_holdout(
         holdout_df=frame.select(
             "sample",
@@ -891,6 +1068,15 @@ def spatial_holdout(
 
     n_buffer = int(np.count_nonzero(in_buffer))
     n_train = int(train.height - n_buffer)
+    # Label balance between the samples that train and those that test
+    # (buffer rows train on nothing), stratified or not, so the two picks
+    # can be compared on the same numbers.
+    used = split_manager.holdout.filter(pl.col("split") != SPLIT_BUFFER)
+    bin_gap, ks = _label_balance(
+        used.get_column(label),
+        (used.get_column("split") == "test").to_numpy(),
+        n_bins,
+    )
     report: Dict[str, Any] = {
         "label": label,
         "method": method,
@@ -903,7 +1089,9 @@ def spatial_holdout(
         "cell_source": (
             None
             if method != "grid"
-            else "config" if settings.cell_km is not None else "auto"
+            else "config"
+            if settings.cell_km is not None
+            else "auto"
         ),
         "gap_km": cluster_info.get("gap_km"),
         "gap_source": cluster_info.get("gap_source"),
@@ -918,6 +1106,11 @@ def spatial_holdout(
         "n_train": n_train,
         "n_buffer": n_buffer,
         "buffer_loss": (n_buffer / train.height) if train.height else 0.0,
+        "stratified": bool(settings.stratify),
+        # Largest gap between a label bin's share of test and of all
+        # samples, and the KS distance between the train and test labels.
+        "label_bin_max_gap": bin_gap,
+        "label_ks": ks,
         # Leakage before the buffer: test samples with a training sample
         # this close (what the bioproject holdout looks like here).
         "test_within_1km_before": _share_within(before, 1.0),
@@ -933,6 +1126,8 @@ def spatial_holdout(
         else f"clusters, gap {target:.0f} km ({report['gap_source']}), "
         f"{report['n_too_big']} too big for test"
     )
+    if settings.stratify:
+        sizing += ", test groups stratified on the label"
     logger.info(
         "Spatial holdout for '%s': %s, %d of %d groups to test; buffer "
         "%.1f km (%s) removed %d of %d training samples (%.1f%%)",
@@ -972,6 +1167,9 @@ REPORT_SCHEMA = {
     "n_train": pl.Int64,
     "n_buffer": pl.Int64,
     "buffer_loss": pl.Float64,
+    "stratified": pl.Boolean,
+    "label_bin_max_gap": pl.Float64,
+    "label_ks": pl.Float64,
     "test_within_1km_before": pl.Float64,
     "test_within_10km_before": pl.Float64,
     "test_within_50km_before": pl.Float64,

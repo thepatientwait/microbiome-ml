@@ -1770,11 +1770,13 @@ class Dataset:
         """Holdout split in space, with a buffer, for one or all labels.
 
         Whole grid cells (method="grid") or site clusters
-        (method="cluster") go to test, label-stratified as in
-        :meth:`create_holdout_split`, and training samples within the
-        buffer distance of any test sample get ``split = "buffer"`` (in
-        neither set). Distances are haversine; cell size and buffer may be
-        "auto" (from the label's variogram). See
+        (method="cluster") go to test -- at random, or chosen to even out
+        the label's bins with ``spatial.stratify`` -- and, for the grid,
+        training samples within the buffer distance of any test sample get
+        ``split = "buffer"`` (in neither set). Distances are haversine;
+        cell size and buffer may be "auto" (from the label's variogram).
+        A cluster holdout keeps ``spatial_cluster`` on every row, which
+        :meth:`create_cv_folds` can use as its grouping. See
         :mod:`microbiome_ml.wrangle.spatial`.
 
         Args:
@@ -1789,7 +1791,7 @@ class Dataset:
             output_dir: If given, writes ``<label>/holdout.csv`` there,
                 plus ``spatial_report.tsv`` and ``spatial_variogram.tsv``.
             method: "grid" (cells) or "cluster" (sites joined within a
-                gap, oversize clusters cut at the median).
+                gap; oversize clusters stay in training whole).
 
         Returns:
             Self for chaining. The report and variogram are also kept on
@@ -2465,6 +2467,11 @@ class Dataset:
                 - "all" (default): Create CV schemes for all groupings + random
                 - "random": Create only random (no grouping) CV scheme
                 - <column_name>: Create CV scheme for specific grouping column
+                - "spatial_cluster": the clusters of a cluster spatial
+                  holdout (:meth:`create_spatial_holdout_split` with
+                  ``method="cluster"``), taken per label from its holdout
+                  rather than from the groupings table. "all" adds it for
+                  every label that has such a holdout.
                 - None: Same as "random" (backward compatibility)
             random_state: Random seed for reproducibility
             force: If True, overwrite existing CV schemes
@@ -2532,8 +2539,37 @@ class Dataset:
         else:
             label_list = all_label_cols
 
-        # Determine which groupings to use
-        if grouping == "all":
+        # Spatial clusters are per label -- each label's labelled samples
+        # were clustered on their own -- so they live on the label's
+        # holdout, not in the groupings table.
+        from microbiome_ml.wrangle.spatial import CLUSTER_COLUMN
+
+        cluster_labels: set[str] = set()
+        for lbl in label_list:
+            held = self.splits[lbl].holdout if lbl in self.splits else None
+            if held is not None and CLUSTER_COLUMN in held.columns:
+                cluster_labels.add(lbl)
+        table_groupings = (
+            [c for c in self.groupings.columns if c != "sample"]
+            if self.groupings is not None
+            else []
+        )
+
+        # Determine which groupings to use: (scheme name, grouping column)
+        groupings_to_use: List[Tuple[str, Optional[str]]]
+        if (
+            grouping == CLUSTER_COLUMN
+            and CLUSTER_COLUMN not in table_groupings
+        ):
+            missing = [lbl for lbl in label_list if lbl not in cluster_labels]
+            if missing:
+                raise ValueError(
+                    f"grouping '{CLUSTER_COLUMN}' needs a cluster spatial "
+                    f"holdout (holdout token spatial_cluster) for every label; "
+                    f"none for {missing}"
+                )
+            groupings_to_use = [(CLUSTER_COLUMN, CLUSTER_COLUMN)]
+        elif grouping == "all":
             # Get all available grouping columns
             if self.groupings is not None:
                 available_groupings = [
@@ -2546,8 +2582,10 @@ class Dataset:
             groupings_to_use = [("random", None)] + [
                 (g, g) for g in available_groupings
             ]
+            if cluster_labels and CLUSTER_COLUMN not in available_groupings:
+                groupings_to_use.append((CLUSTER_COLUMN, CLUSTER_COLUMN))
 
-            if not available_groupings:
+            if not available_groupings and not cluster_labels:
                 logger.warning(
                     "No groupings available, creating only random CV"
                 )
@@ -2593,6 +2631,20 @@ class Dataset:
                 self.splits[lbl] = SplitManager(lbl)
 
             for scheme_name, grouping_col, method in scheme_specs:
+                from_holdout = (
+                    grouping_col == CLUSTER_COLUMN
+                    and CLUSTER_COLUMN not in table_groupings
+                )
+                if from_holdout and lbl not in cluster_labels:
+                    # Only reachable with grouping="all": another label
+                    # had a cluster holdout and this one did not.
+                    logger.warning(
+                        "No cluster spatial holdout for '%s'; skipping CV "
+                        "scheme '%s'",
+                        lbl,
+                        scheme_name,
+                    )
+                    continue
                 # Check if scheme already exists
                 if scheme_name in self.splits[lbl].cv_schemes and not force:
                     logger.warning(
@@ -2616,7 +2668,14 @@ class Dataset:
                 # Prepare data
                 data = self.labels.select(["sample", lbl])
 
-                if grouping_col is not None and self.groupings is not None:
+                if from_holdout:
+                    holdout = self.splits[lbl].holdout
+                    assert holdout is not None  # in cluster_labels
+                    groups = holdout.select(["sample", CLUSTER_COLUMN])
+                    data = data.join(
+                        groups, on="sample", how="left", coalesce=True
+                    )
+                elif grouping_col is not None and self.groupings is not None:
                     groups = self.groupings.select(["sample", grouping_col])
                     data = data.join(
                         groups, on="sample", how="left", coalesce=True

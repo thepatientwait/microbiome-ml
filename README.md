@@ -427,7 +427,26 @@ split:
       gap_km: auto              # km, or auto: largest of 25/50/100/200/400
       max_cluster_share: 0.05   # bigger clusters never go to test
       max_oversize_share: 0.5   # auto gap: at most this share too big
+      stratify: false           # true: pick test clusters to even the label
 ```
+
+**Stratified test clusters** (`stratify: true`, grid or cluster). The
+groups and distances stay as they are; only the choice of which whole
+groups go to test looks at the label. The label is cut into
+`split.holdout.n_bins` equal-width bins, and a group is taken only if it
+brings test's count in every bin closer to `test_size` of that bin, so
+test can end a few groups short. The report's `label_bin_max_gap` (largest
+gap between a bin's share of test and of all samples) and `label_ks` (KS
+distance, train vs test labels) are written for every spatial run, so a
+stratified and a random pick compare on the same numbers.
+
+**Clusters as CV groups.** A cluster holdout keeps `spatial_cluster` on
+every row, and `split.cv.grouping: spatial_cluster` (or `all`, which adds
+it) packs the training pool's clusters into stratified folds, so the folds
+are `gap_km` apart from each other as well as from test. The clusters too
+big for test are all in the training pool, and one bigger than a fold's
+share cannot be balanced: the split log warns with the fold sizes when
+that happens.
 
 On the real coordinates, test came to 20.0% with nothing deleted:
 ITS_marine gap 400 km (13 test clusters), 18S_marine 200 km (144),
@@ -1268,7 +1287,8 @@ groupings:
   which does that for you. Setting `split.holdout.taxon_rank` instead replaces
   the metadata grouping with a community-membership split (see *Holding out by
   community membership*); it needs no grouping column.
-- `split.cv.grouping: all` builds a fold scheme for every grouping column;
+- `split.cv.grouping: all` builds a fold scheme for every grouping column
+  (and `spatial_cluster` after a cluster spatial holdout);
   `cv.scheme: [random, month, zone]` then limits which schemes are actually
   trained. `random` is the ungrouped baseline. With
   `split.cv.methods: [kfold, logo]` each grouping yields two schemes,
